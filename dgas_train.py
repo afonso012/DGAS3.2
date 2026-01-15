@@ -12,7 +12,7 @@ from dgas_data import AudioLoader  # <--- NOVA IMPORTAÇÃO
 
 # --- CONFIGURAÇÃO E HIPERPARÂMETROS ---
 CONFIG = {
-    "DATA_DIR": "./dataset_audio", # <--- CRIA ESTA PASTA E PÕE LÁ MÚSICA
+    "DATA_DIR": "/Users/afonsocosta/musicas_teste", # <--- CRIA ESTA PASTA E PÕE LÁ MÚSICA
     "SAMPLE_RATE": 44100,
     "N_FFT": 2048,
     "HOP_LENGTH": 512,
