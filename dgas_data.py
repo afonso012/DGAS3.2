@@ -7,148 +7,150 @@ import threading
 import queue
 import random
 import os
+import pyloudnorm as pyln
 from typing import List, Tuple, Optional
 
-# --- CONFIGURAÇÃO DE DSP ---
-# Devem bater certo com o dgas_train.py
+# --- CONFIGURAÇÃO DSP (Igual ao Train) ---
 SAMPLE_RATE = 44100
 N_FFT = 2048
 HOP_LENGTH = 512
-CHUNK_DURATION = 3.0  # Segundos de áudio por amostra de treino
+CHUNK_DURATION = 3.0
 CHUNK_SAMPLES = int(CHUNK_DURATION * SAMPLE_RATE)
+TARGET_LUFS = -24.0  # Padrão Broadcast (EBU R 128)
 
 class AudioLoader:
     """
-    Carregador de Áudio Assíncrono para Treino de Alta Performance.
-    Lê ficheiros do disco, processa DSP e coloca em fila para a GPU.
+    Carregador Profissional DGAS (MUSDB18 Compatible).
+    Lê pares (Mistura, Stem) e normaliza loudness.
     """
     def __init__(self, data_dir: str, batch_size: int = 4, queue_size: int = 20):
         self.data_dir = data_dir
         self.batch_size = batch_size
-        self.file_list = self._scan_files(data_dir)
+        self.track_folders = self._scan_musdb(data_dir)
         
-        if not self.file_list:
-            print(f"WARNING: No audio files found in {data_dir}. Using dummy mode.")
+        # Medidor LUFS
+        self.meter = pyln.Meter(SAMPLE_RATE)
         
-        # Fila thread-safe para passar dados para o JAX
+        if not self.track_folders:
+            print(f"CRITICAL WARNING: No song folders found in {data_dir}. Check paths.")
+        else:
+            print(f"Dataset Index: Found {len(self.track_folders)} songs.")
+        
         self.queue = queue.Queue(maxsize=queue_size)
         self.running = False
         self.worker_thread = None
 
-    def _scan_files(self, directory: str) -> List[str]:
-        """Encontra todos os ficheiros wav/mp3/flac recursivamente."""
-        files = []
-        valid_exts = ('.wav', '.mp3', '.flac', '.ogg', '.stem.m4a')
+    def _scan_musdb(self, directory: str) -> List[str]:
+        """
+        Procura pastas do MUSDB18 que contenham 'mixture.wav' e 'vocals.wav'.
+        """
+        valid_folders = []
         if not os.path.exists(directory):
             return []
             
-        for root, _, filenames in os.walk(directory):
-            for filename in filenames:
-                if filename.lower().endswith(valid_exts):
-                    files.append(os.path.join(root, filename))
-        return files
+        for root, dirs, files in os.walk(directory):
+            # Verifica se é uma pasta de música válida
+            if 'mixture.wav' in files and 'vocals.wav' in files:
+                valid_folders.append(root)
+        
+        return valid_folders
 
-    def _load_chunk(self, filepath: str) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Lê um pedaço aleatório do ficheiro de áudio.
-        Retorna (Mistura, Target).
-        """
+    def _normalize_lufs(self, audio: np.ndarray) -> np.ndarray:
+        """Aplica Normalização EBU R 128 para estabilizar o treino."""
         try:
-            # Obter duração total sem ler o ficheiro todo
-            info = sf.info(filepath)
+            # Medir loudness (Integrado)
+            loudness = self.meter.integrated_loudness(audio)
+            
+            # Proteger contra silêncio absoluto (-inf)
+            if loudness == -float('inf'):
+                return audio
+                
+            # Calcular ganho necessário
+            delta = TARGET_LUFS - loudness
+            
+            # Limitar ganho para evitar explosão de ruído em silêncios (+- 20dB max)
+            if delta > 20: delta = 20
+            if delta < -20: delta = -20
+                
+            gain = 10.0 ** (delta / 20.0)
+            normalized_audio = audio * gain
+            
+            # Hard Clip limiter de segurança (-1.0 a 1.0)
+            return np.clip(normalized_audio, -1.0, 1.0)
+            
+        except Exception:
+            return audio
+
+    def _load_chunk_pair(self, folder_path: str) -> Tuple[np.ndarray, np.ndarray]:
+        """Lê o mesmo intervalo de tempo da mistura e da vocal."""
+        mix_path = os.path.join(folder_path, 'mixture.wav')
+        vox_path = os.path.join(folder_path, 'vocals.wav')
+        
+        try:
+            # Ler metadados do mixture para saber a duração
+            info = sf.info(mix_path)
             total_samples = info.frames
             
+            # Definir ponto de início aleatório
             if total_samples < CHUNK_SAMPLES:
-                # Se for muito curto, fazer padding ou ignorar
-                # Aqui fazemos loop simples
                 start = 0
-                frames_to_read = total_samples
             else:
                 start = random.randint(0, total_samples - CHUNK_SAMPLES)
-                frames_to_read = CHUNK_SAMPLES
                 
-            audio, _ = sf.read(filepath, start=start, frames=frames_to_read, dtype='float32')
+            # Ler ambos os ficheiros sincronizados
+            # always_2d=True garante que mono venha como (N, 1)
+            mix, _ = sf.read(mix_path, start=start, frames=CHUNK_SAMPLES, dtype='float32', always_2d=True)
+            vox, _ = sf.read(vox_path, start=start, frames=CHUNK_SAMPLES, dtype='float32', always_2d=True)
             
-            # Garantir estéreo e tamanho fixo
-            if len(audio.shape) == 1: # Mono -> Stereo
-                audio = np.stack([audio, audio], axis=-1)
+            # Garantir stereo (N, 2) se for mono
+            if mix.shape[1] == 1: mix = np.tile(mix, (1, 2))
+            if vox.shape[1] == 1: vox = np.tile(vox, (1, 2))
             
-            # Padding se necessário (para clips curtos)
-            if audio.shape[0] < CHUNK_SAMPLES:
-                pad_len = CHUNK_SAMPLES - audio.shape[0]
-                audio = np.pad(audio, ((0, pad_len), (0, 0)))
+            # Padding com zeros se o ficheiro for menor que 3s
+            if mix.shape[0] < CHUNK_SAMPLES:
+                pad_len = CHUNK_SAMPLES - mix.shape[0]
+                mix = np.pad(mix, ((0, pad_len), (0, 0)))
+                vox = np.pad(vox, ((0, pad_len), (0, 0)))
             else:
-                audio = audio[:CHUNK_SAMPLES, :]
-            
-            # --- SIMULAÇÃO DE SEPARAÇÃO (AUTOSUPERVISIONADO) ---
-            # Em dados reais (MusDB18), carregaríamos 'mixture.wav' e 'vocals.wav'.
-            # Para dados brutos sem stems, usamos uma estratégia auto-supervisionada:
-            # Mistura = Audio Original + Ruído
-            # Target = Audio Original (Denoising/Restoration Task)
-            
-            target = audio
-            
-            # Gerar "Mistura" degradada artificialmente
-            noise = np.random.normal(0, 0.05, audio.shape).astype(np.float32)
-            mixture = target + noise
-            
-            return mixture, target
+                mix = mix[:CHUNK_SAMPLES]
+                vox = vox[:CHUNK_SAMPLES]
+                
+            return mix, vox
             
         except Exception as e:
-            print(f"Error loading {filepath}: {e}")
+            print(f"Error reading {folder_path}: {e}")
             return np.zeros((CHUNK_SAMPLES, 2)), np.zeros((CHUNK_SAMPLES, 2))
 
     def _augment_physics(self, mixture: np.ndarray) -> np.ndarray:
-        """
-        Aplica Augmentação Física (CPU/Numpy).
-        """
-        # 1. Phase Jitter (Simulação de Wow/Flutter)
-        # Shift temporal aleatório muito subtil
+        """Simula degradações físicas (Fita, Vinil, Saturação)."""
+        # 1. Phase Jitter (Wow/Flutter)
         if random.random() < 0.5:
             shift = random.randint(-10, 10)
             mixture = np.roll(mixture, shift, axis=0)
             
-        # 2. Soft Clipping (Saturação)
+        # 2. Soft Clipping Analógico
         if random.random() < 0.3:
+            # Tanh simula a curva de saturação de transístores/válvulas
             mixture = np.tanh(mixture * 1.5)
             
         return mixture
 
     def _compute_spectrogram(self, audio: np.ndarray) -> np.ndarray:
-        """
-        Converte Time-Domain -> Complex Spectrogram.
-        Retorna shape (Time, Freq, Channels, 2) onde o último 2 é (Real, Imag).
-        """
-        # Audio input: (Samples, Channels)
-        # Transpor para librosa: (Channels, Samples)
+        # Transpose para (Channels, Samples) para o Librosa
         audio_T = audio.T
-        
         specs = []
         for ch in range(audio_T.shape[0]):
             stft = librosa.stft(audio_T[ch], n_fft=N_FFT, hop_length=HOP_LENGTH)
-            # stft shape: (Freq, Time Frames) -> Transpor para (Time, Freq)
-            stft = stft.T
-            # Separar Real e Imag
-            # Shape final: (Time, Freq, 2)
+            stft = stft.T # (Time, Freq)
+            # Stack Real/Imag: (Time, Freq, 2)
             complex_view = np.stack([stft.real, stft.imag], axis=-1)
             specs.append(complex_view)
-            
-        # Stack Channels: (Time, Freq, Channels, 2) -> (Time, Freq, 2) se for Mono
-        # O modelo espera (Time, Freq, Channels) mas Channels está implícito na dimensão complexa?
-        # Vamos verificar o dgas_model.py. 
-        # O modelo espera `mixture_spec` como (Time, Freq, 2) para processamento canal a canal via vmap?
-        # O treino faz: B, T, F, C.
         
-        # Vamos retornar (Time, Freq, Channels) onde Channels é na verdade 2 * Stereo = 4 dimensões?
-        # NÃO. O dgas_model processa 2 dimensões (Real/Imag).
-        # Se temos estéreo, processamos cada canal independentemente ou concatenados?
-        # Para simplificar o data loader inicial: Retornamos apenas o Canal Esquerdo (Mono) ou média.
-        # OU melhor: Retornamos (Batch, Time, Freq, 2) onde 2 é Real/Imag de UM canal.
-        # Para Stereo real, o Batch size duplicaria.
-        
-        # Vamos assumir MONO mixdown para começar a validar o pipeline real.
-        spec_mono = specs[0] # Canal Esquerdo
-        return spec_mono.astype(np.float32)
+        # Média Stereo para Input Mono (Roadmap v3.2 Standard)
+        # Processar Stereo completo duplicaria a VRAM necessária.
+        # Para "God Tier" com VRAM limitada, Mono Spec de alta resolução é preferível.
+        spec_avg = np.mean(specs, axis=0) 
+        return spec_avg.astype(np.float32)
 
     def _worker(self):
         while self.running:
@@ -156,44 +158,38 @@ class AudioLoader:
             batch_target = []
             
             for _ in range(self.batch_size):
-                # Escolher ficheiro aleatório
-                if not self.file_list:
-                    # Fallback dummy se não houver ficheiros
-                    dummy_mix = np.random.randn(128, 128, 2).astype(np.float32)
-                    dummy_tgt = np.random.randn(128, 128, 2).astype(np.float32)
-                    batch_mix.append(dummy_mix)
-                    batch_target.append(dummy_tgt)
+                if not self.track_folders:
+                    # Dummy fallback
+                    batch_mix.append(np.zeros((128, 128, 2)))
+                    batch_target.append(np.zeros((128, 128, 2)))
                     continue
 
-                fpath = random.choice(self.file_list)
-                mix_wav, tgt_wav = self._load_chunk(fpath)
+                folder = random.choice(self.track_folders)
+                mix_wav, vox_wav = self._load_chunk_pair(folder)
                 
-                # Augmentação
-                mix_wav = self._augment_physics(mix_wav)
+                # --- PROCESSAMENTO CRÍTICO ---
+                # 1. Normalizar Loudness (Estabilidade)
+                mix_wav = self._normalize_lufs(mix_wav)
+                vox_wav = self._normalize_lufs(vox_wav)
                 
-                # STFT
-                # Nota: O tamanho exato do tempo depende do CHUNK_DURATION.
-                # 3s @ 44.1k / 512 hop ~= 258 frames.
-                # Precisamos de garantir tamanho fixo para o JAX (ex: cortar ou pad).
-                spec_mix = self._compute_spectrogram(mix_wav)
-                spec_tgt = self._compute_spectrogram(tgt_wav)
+                # 2. Augmentação Física (Só na mistura)
+                mix_wav_aug = self._augment_physics(mix_wav.copy())
                 
-                # Crop para garantir 128x128 ou o que o modelo espera
-                # O modelo atual aceita qualquer tamanho, mas para batching precisamos de igualdade.
-                # Vamos fixar Time=128, Freq=1025 (padrão 2048 FFT).
-                # Para testes rápidos, vamos fazer crop drástico:
+                # 3. STFT
+                spec_mix = self._compute_spectrogram(mix_wav_aug)
+                spec_tgt = self._compute_spectrogram(vox_wav)
+                
+                # 4. Crop Seguro (Garantir dimensões fixas para o Batch)
+                # O crop temporal (128) define a janela de contexto da rede
                 spec_mix = spec_mix[:128, :128, :]
                 spec_tgt = spec_tgt[:128, :128, :]
                 
                 batch_mix.append(spec_mix)
                 batch_target.append(spec_tgt)
             
-            # Stack e converter para JAX Array (na thread principal depois)
-            batch_mix_np = np.stack(batch_mix)
-            batch_target_np = np.stack(batch_target)
-            
             try:
-                self.queue.put((batch_mix_np, batch_target_np), timeout=1)
+                # Colocar na fila
+                self.queue.put((np.stack(batch_mix), np.stack(batch_target)), timeout=1)
             except queue.Full:
                 continue
 
@@ -201,38 +197,12 @@ class AudioLoader:
         self.running = True
         self.worker_thread = threading.Thread(target=self._worker, daemon=True)
         self.worker_thread.start()
-        print(f"Data Loader started. Scanning {self.data_dir}...")
+        print(f"DGAS Data Engine Started. Target: {TARGET_LUFS} LUFS")
 
     def stop(self):
         self.running = False
-        if self.worker_thread:
-            self.worker_thread.join()
-
+        if self.worker_thread: self.worker_thread.join()
+    
     def get_batch(self):
-        # Bloqueia até ter dados
         mix, tgt = self.queue.get()
-        # Converter para JAX aqui é seguro? Sim, JAX array creation é rápida.
         return jnp.array(mix), jnp.array(tgt)
-
-# --- TESTE UNITÁRIO DO DATA LOADER ---
-if __name__ == "__main__":
-    # Cria uma pasta dummy e um ficheiro wav dummy para testar
-    os.makedirs("dummy_data", exist_ok=True)
-    dummy_audio = np.random.uniform(-1, 1, (44100*5, 2))
-    sf.write("dummy_data/test.wav", dummy_audio, 44100)
-    
-    loader = AudioLoader("dummy_data", batch_size=4)
-    loader.start()
-    
-    try:
-        print("Waiting for batch...")
-        b_mix, b_tgt = loader.get_batch()
-        print(f"Batch received!")
-        print(f"Mix Shape: {b_mix.shape}") # Esperado: (4, 128, 128, 2)
-        print(f"Target Shape: {b_tgt.shape}")
-        
-    finally:
-        loader.stop()
-        # Limpar dummy
-        os.remove("dummy_data/test.wav")
-        os.rmdir("dummy_data")

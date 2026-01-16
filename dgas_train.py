@@ -6,30 +6,30 @@ import numpy as np
 import time
 from typing import Tuple
 
-# Importar Componentes do Projeto
+# Importar Componentes
 from dgas_model import DGASField
-from dgas_data import AudioLoader  # <--- NOVA IMPORTAÇÃO
+from dgas_data import AudioLoader
 
 # --- CONFIGURAÇÃO E HIPERPARÂMETROS ---
 CONFIG = {
-    "DATA_DIR": "/Users/afonsocosta/musicas_teste", # <--- CRIA ESTA PASTA E PÕE LÁ MÚSICA
+    # APONTA ISTO PARA A TUA PASTA 'train' DO MUSDB18
+    "DATA_DIR": "'/Volumes/DSAG DRIVE/raw_data/musdb18hq/train'", 
+    
     "SAMPLE_RATE": 44100,
     "N_FFT": 2048,
     "HOP_LENGTH": 512,
     "LATENT_DIM": 128,
-    "BATCH_SIZE": 4,
+    "BATCH_SIZE": 4,       # Se tiveres VRAM de sobra (16GB+), aumenta para 8
     "LEARNING_RATE": 3e-4,
     "WARMUP_STEPS": 1000,
     "TOTAL_STEPS": 100000,
     "GAN_WEIGHT_MAX": 0.1,
     "APML_WEIGHT": 10.0,
-    "PHASE_WEIGHT": 1.0,
+    "PHASE_WEIGHT": 0.5,   # Peso da nova Loss de Fase
 }
 
-# --- 1. COMPONENTES AUXILIARES (ENCODER & DISCRIMINATOR) ---
-
+# --- 1. ENCODER & DISCRIMINATOR ---
 class LatentEncoder(eqx.Module):
-    """Hypernetwork Encoder (Roadmap 3.2)."""
     layers: list
     final_proj: eqx.nn.Linear
 
@@ -50,15 +50,11 @@ class LatentEncoder(eqx.Module):
 
     def __call__(self, x):
         for layer in self.layers:
-            if hasattr(layer, '__call__'):
-                x = layer(x)
-            else:
-                x = layer(x)
+            x = layer(x)
         x = jnp.squeeze(x)
         return self.final_proj(x)
 
 class MultiPeriodDiscriminator(eqx.Module):
-    """Discriminador para o Refinamento Adversarial."""
     layers: list
 
     def __init__(self, key):
@@ -73,14 +69,10 @@ class MultiPeriodDiscriminator(eqx.Module):
 
     def __call__(self, x):
         for layer in self.layers:
-            if hasattr(layer, '__call__'):
-                x = layer(x)
-            else:
-                x = layer(x)
+            x = layer(x)
         return jnp.mean(x)
 
-# --- 2. SISTEMA DE PERDAS (LOSS FUNCTIONS) ---
-
+# --- 2. LOSS FUNCTIONS AVANÇADAS ---
 def get_apml_mask(n_freq_bins, sample_rate):
     freqs = jnp.linspace(0, sample_rate / 2, n_freq_bins)
     sensibilidade = 1.0 + 9.0 * jnp.exp(-0.5 * ((freqs - 3000) / 1000)**2)
@@ -90,17 +82,23 @@ def get_apml_mask(n_freq_bins, sample_rate):
 def loss_fn_generator(generator_model, encoder_model, discriminator_model, batch_mix, batch_target, key, step_num):
     B, T, F, C = batch_mix.shape
     
-    # Encoder
+    # 1. Encoder com Injeção de Ruído (Robustez Latente)
     batch_mix_transposed = jnp.transpose(batch_mix, (0, 3, 1, 2))
     mix_flat = batch_mix_transposed.reshape(B, C, -1)
     z_batch = jax.vmap(encoder_model)(mix_flat)
-
-    # Rectified Flow Matching
-    t_flow = jax.random.uniform(key, (B, 1, 1, 1))
+    
+    # Noise Injection: Permite usar Temperature na inferência
+    key_noise, key_flow = jax.random.split(key)
+    z_noise = jax.random.normal(key_noise, z_batch.shape) * 0.1 # 10% perturbação
+    z_robust = z_batch + z_noise
+    
+    # 2. Rectified Flow
+    t_flow = jax.random.uniform(key_flow, (B, 1, 1, 1))
+    # Interpolação no domínio complexo (Linear)
     x_t = (1 - t_flow) * batch_mix + t_flow * batch_target 
     target_velocity = batch_target - batch_mix
     
-    # Inferência Real (Vetorizada)
+    # 3. Inferência Vetorizada
     t_space = jnp.linspace(0, 1, T)
     f_space = jnp.linspace(0, 1, F)
     
@@ -110,42 +108,60 @@ def loss_fn_generator(generator_model, encoder_model, discriminator_model, batch
     predicted_velocity = jax.vmap(
         jax.vmap(jax.vmap(apply_model_point, in_axes=(None, 0, None)), in_axes=(0, None, None)),
         in_axes=(None, None, 0)
-    )(t_space, f_space, z_batch)
+    )(t_space, f_space, z_robust) # Usar z_robust
 
+    # Loss Principal (Matching)
     loss_flow = jnp.mean((predicted_velocity - target_velocity) ** 2)
 
-    # APML
+    # Loss Psicoacústica (APML)
     apml_mask = get_apml_mask(F, CONFIG["SAMPLE_RATE"])
     error = (predicted_velocity - target_velocity)
     loss_apml = jnp.mean((error ** 2) * apml_mask)
 
-    # Adversarial (Curriculum)
+    # --- NOVA: PHASE CONSISTENCY LOSS ---
+    # Penaliza desvios na derivada da fase (frequência instantânea)
+    # Evita artefactos "robóticos"
+    def get_phase_grad(spec):
+        # spec: (Batch, Time, Freq, 2)
+        complex_spec = spec[..., 0] + 1j * spec[..., 1]
+        angle = jnp.angle(complex_spec)
+        # Diferença finita no eixo temporal
+        return angle[:, 1:, :] - angle[:, :-1, :]
+
+    pred_reconstructed = batch_mix + predicted_velocity
+    grad_pred = get_phase_grad(pred_reconstructed)
+    grad_target = get_phase_grad(batch_target)
+    loss_phase = jnp.mean(jnp.abs(grad_pred - grad_target))
+
+    # Loss Adversarial (GAN)
     progress = jnp.clip((step_num - CONFIG["WARMUP_STEPS"]) / CONFIG["TOTAL_STEPS"], 0.0, 1.0)
     lambda_adv = progress * CONFIG["GAN_WEIGHT_MAX"]
     
     def compute_adv_loss(_):
-        prediction_reconstructed = batch_mix + predicted_velocity
-        pred_transposed = jnp.transpose(prediction_reconstructed, (0, 3, 1, 2))
+        pred_transposed = jnp.transpose(pred_reconstructed, (0, 3, 1, 2))
         fake_score = jax.vmap(discriminator_model)(pred_transposed)
         return jnp.mean((fake_score - 1.0) ** 2)
 
-    def no_adv_loss(_):
-        return 0.0
+    def no_adv_loss(_): return 0.0
 
     loss_adv = jax.lax.cond(lambda_adv > 0, compute_adv_loss, no_adv_loss, operand=None)
-    total_loss = loss_flow + (CONFIG["APML_WEIGHT"] * loss_apml) + (lambda_adv * loss_adv)
     
-    return total_loss, (loss_flow, loss_apml, loss_adv)
+    # Soma Ponderada Final
+    total_loss = loss_flow + \
+                 (CONFIG["APML_WEIGHT"] * loss_apml) + \
+                 (lambda_adv * loss_adv) + \
+                 (CONFIG["PHASE_WEIGHT"] * loss_phase)
+    
+    return total_loss, (loss_flow, loss_apml, loss_adv, loss_phase)
 
 def loss_fn_discriminator(discriminator_model, generator_model, encoder_model, batch_mix, batch_target, key):
     B, T, F, C = batch_mix.shape
     
-    # Encoder
     batch_mix_transposed = jnp.transpose(batch_mix, (0, 3, 1, 2))
     mix_flat = batch_mix_transposed.reshape(B, C, -1)
     z_batch = jax.vmap(encoder_model)(mix_flat)
     
-    # Mock para poupar VRAM no passo do discriminador
+    # Mock velocity para poupar VRAM no passo do discriminador
     predicted_velocity = batch_target - batch_mix 
     fake_audio = batch_mix + predicted_velocity
     
@@ -158,8 +174,7 @@ def loss_fn_discriminator(discriminator_model, generator_model, encoder_model, b
     loss_d = 0.5 * (jnp.mean((real_score - 1.0) ** 2) + jnp.mean((fake_score - 0.0) ** 2))
     return loss_d
 
-# --- 3. PASSO DE TREINO (UPDATE STEP) ---
-
+# --- 3. PASSO DE TREINO ---
 @eqx.filter_jit
 def train_step(models, opt_states, batch_mix, batch_target, key, step_num, optimizers):
     gen_model, enc_model, disc_model = models
@@ -167,7 +182,7 @@ def train_step(models, opt_states, batch_mix, batch_target, key, step_num, optim
     opt_g, opt_d = optimizers
     key_gen, key_disc = jax.random.split(key)
 
-    # Update G + E
+    # Train Generator
     def combined_loss(params_g_combo, d_model, b_mix, b_tgt, k, s):
         g_model, e_model = params_g_combo
         return loss_fn_generator(g_model, e_model, d_model, b_mix, b_tgt, k, s)
@@ -176,11 +191,10 @@ def train_step(models, opt_states, batch_mix, batch_target, key, step_num, optim
     (g_loss, aux_losses), g_grads = eqx.filter_value_and_grad(combined_loss, has_aux=True)(
         params_g, disc_model, batch_mix, batch_target, key_gen, step_num
     )
-    
     updates_g, new_opt_g_state = opt_g.update(g_grads, opt_g_state, params_g)
     gen_model, enc_model = eqx.apply_updates(params_g, updates_g)
 
-    # Update D
+    # Train Discriminator
     is_warmup = step_num < CONFIG["WARMUP_STEPS"]
     d_diff, d_static = eqx.partition(disc_model, eqx.is_array)
     
@@ -205,12 +219,11 @@ def train_step(models, opt_states, batch_mix, batch_target, key, step_num, optim
     return (gen_model, enc_model, new_disc_model), (new_opt_g_state, new_opt_d_state), g_loss, d_loss, aux_losses
 
 # --- 4. LOOP PRINCIPAL ---
-
 def main():
-    print("=== DGAS 3.2 TRAINING PIPELINE (REAL DATA MODE) ===")
-    print(f"Configuration: {CONFIG}")
+    print("=== DGAS 3.2: GOD TIER TRAINING PROTOCOL ===")
+    print(f"Dataset Path: {CONFIG['DATA_DIR']}")
     
-    # 1. Inicializar Data Loader
+    # 1. Loader com LUFS & Stems
     loader = AudioLoader(
         data_dir=CONFIG["DATA_DIR"], 
         batch_size=CONFIG["BATCH_SIZE"]
@@ -218,7 +231,7 @@ def main():
     loader.start()
     
     try:
-        # 2. Inicializar Modelos
+        # 2. Inicialização
         key = jax.random.PRNGKey(42)
         k_gen, k_enc, k_disc = jax.random.split(key, 3)
         
@@ -227,7 +240,6 @@ def main():
         discriminator = MultiPeriodDiscriminator(k_disc)
         models = (generator, encoder, discriminator)
         
-        # 3. Otimizadores
         scheduler = optax.warmup_cosine_decay_schedule(
             init_value=0.0, 
             peak_value=CONFIG["LEARNING_RATE"], 
@@ -244,17 +256,15 @@ def main():
         optimizers = (optim_g, optim_d)
         opt_states = (opt_g_state, opt_d_state)
         
-        print("Waiting for data buffer...")
-        # Pré-aquecer o buffer de dados
-        time.sleep(2) 
+        print("Warming up Data Pipeline...")
+        time.sleep(3) # Deixar o buffer encher
         
-        print(f"System Initialized. Starting Training on {CONFIG['DATA_DIR']}...")
+        print("STARTING TRAINING...")
         
-        # 4. Training Loop
         for step in range(CONFIG["TOTAL_STEPS"]):
             key, subkey = jax.random.split(key)
             
-            # --- CARREGAR DADOS REAIS ---
+            # Batch Real do MUSDB18
             batch_mix, batch_target = loader.get_batch()
             
             models, opt_states, g_loss, d_loss, aux = train_step(
@@ -262,17 +272,17 @@ def main():
             )
             
             if step % 10 == 0:
-                l_flow, l_apml, l_adv = aux
+                l_flow, l_apml, l_adv, l_phase = aux
                 status = "WARMUP" if step < CONFIG["WARMUP_STEPS"] else "HYBRID"
-                print(f"Step {step:05d} [{status}] | G_Loss: {g_loss:.4f} (Flow: {l_flow:.4f}, APML: {l_apml:.4f}) | D_Loss: {d_loss:.4f}")
+                # Log mais detalhado com Phase Loss
+                print(f"Step {step:05d} [{status}] | G_Loss: {g_loss:.4f} (Flow: {l_flow:.4f}, APML: {l_apml:.4f}, Phase: {l_phase:.4f}) | D_Loss: {d_loss:.4f}")
 
             if step == CONFIG["WARMUP_STEPS"]:
                 print(f"\n>>> PHASE 2 ACTIVATED: ADVERSARIAL REFINEMENT ENABLED (Step {step})\n")
                 
-            # Opcional: Salvar Checkpoint a cada 1000 passos
             if step > 0 and step % 1000 == 0:
-                eqx.tree_serialise_leaves(f"dgas_checkpoint_{step}.eqx", models)
-                print(f"Checkpoint saved: dgas_checkpoint_{step}.eqx")
+                eqx.tree_serialise_leaves(f"dgas_musdb_step_{step}.eqx", models)
+                print(f"Checkpoint saved: dgas_musdb_step_{step}.eqx")
 
     except KeyboardInterrupt:
         print("\nTraining interrupted by user.")
