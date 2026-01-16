@@ -3,16 +3,13 @@ import jax.numpy as jnp
 import equinox as eqx
 from typing import Callable, List
 
-# --- MÓDULO 1: MATEMÁTICA DE SUAVIZAÇÃO (C2 CONTINUITY) ---
+# --- MÓDULO 1: MATEMÁTICA ---
 
 def smoother_step(x):
-    """
-    Função de interpolação C2-Continuous (Ordem 5).
-    """
     x = jnp.clip(x, 0.0, 1.0)
     return x * x * x * (x * (x * 6 - 15) + 10)
 
-# --- MÓDULO 2: REPRESENTAÇÃO (HASH GRID) ---
+# --- MÓDULO 2: HASH GRID ---
 
 class ContinuousHashGrid(eqx.Module):
     embeddings: jnp.ndarray
@@ -62,14 +59,16 @@ class FiLMLayer(eqx.Module):
     
     def __init__(self, key, in_features, out_features):
         w_key, b_key = jax.random.split(key)
-        self.weight = jax.random.normal(w_key, (out_features, in_features)) * 0.02
+        # CORREÇÃO SIREN INIT: Distribuição Uniforme com limite sqrt(6/in)
+        limit = jnp.sqrt(6 / in_features)
+        self.weight = jax.random.uniform(w_key, (out_features, in_features), minval=-limit, maxval=limit)
         self.bias = jnp.zeros((out_features,))
 
     def __call__(self, x, gamma, beta):
         out = self.weight @ x + self.bias
         return (1.0 + gamma) * out + beta
 
-# --- MÓDULO 4: O MOTOR NEURAL (SIREN BACKBONE) ---
+# --- MÓDULO 4: O MOTOR NEURAL ---
 
 class DGASField(eqx.Module):
     layers: List[FiLMLayer]
@@ -90,7 +89,7 @@ class DGASField(eqx.Module):
             ContinuousHashGrid(keys[1], resolution=64, output_dim=16),
             ContinuousHashGrid(keys[2], resolution=256, output_dim=16)
         ]
-        input_dim = 16 * 3 + 2 
+        input_dim = 16 * 3 + 2
 
         self.layers = []
         for i in range(num_layers):
@@ -98,82 +97,23 @@ class DGASField(eqx.Module):
 
         film_param_size = 2 * num_layers * hidden_dim
         self.latent_to_film = eqx.nn.Linear(latent_dim, film_param_size, key=keys[-1])
-        self.final_layer = eqx.nn.Linear(hidden_dim, 2, key=keys[-2])
+        
+        # CORREÇÃO ESTÉREO: Output Dim agora é 4 (L_Re, L_Im, R_Re, R_Im)
+        self.final_layer = eqx.nn.Linear(hidden_dim, 4, key=keys[-2])
 
     def __call__(self, t, f, z):
         coords = jnp.array([t, f])
-        
         grid_features = [g(coords) for g in self.grids]
         x = jnp.concatenate(grid_features + [coords], axis=0)
         
         film_params = self.latent_to_film(z)
-        
-        # AQUI OCORRIA O ERRO: Reshape precisa de inteiros estáticos.
-        # Com @eqx.filter_jit, self.num_layers é tratado como static int.
         film_params = film_params.reshape(self.num_layers, 2, self.hidden_dim)
         
         for i, layer in enumerate(self.layers):
             gamma = film_params[i, 0]
             beta = film_params[i, 1]
             x = layer(x, gamma, beta)
-            x = jnp.sin(30.0 * x)
+            x = jnp.sin(30.0 * x) # SIREN Activation
 
         v = self.final_layer(x)
         return v
-
-# --- MÓDULO 5: RECTIFIED FLOW SOLVER (EULER) ---
-
-# CORREÇÃO CRÍTICA: Substituir @jax.jit por @eqx.filter_jit
-# Isto permite ao JAX distinguir entre pesos (Tracer) e inteiros de configuração (Static)
-@eqx.filter_jit
-def solve_single_step(model, mixture_spec, z_latent):
-    """
-    Simulação do Processo de Inferência (1-Step Generation).
-    """
-    
-    def predict_velocity(t_idx, f_idx, val_real, val_imag):
-        T_max, F_max, _ = mixture_spec.shape
-        norm_t = t_idx / T_max
-        norm_f = f_idx / F_max
-        v = model(norm_t, norm_f, z_latent)
-        return v
-
-    T, F, _ = mixture_spec.shape
-    t_indices = jnp.arange(T)
-    f_indices = jnp.arange(F)
-    ts, fs = jnp.meshgrid(t_indices, f_indices, indexing='ij')
-    
-    vals_real = mixture_spec[:, :, 0]
-    vals_imag = mixture_spec[:, :, 1]
-    
-    velocity_field = jax.vmap(
-        jax.vmap(predict_velocity, in_axes=(0, 0, None, None)), 
-        in_axes=(0, 0, 0, 0)
-    )(ts, fs, vals_real, vals_imag)
-    
-    source_prediction = mixture_spec + velocity_field * 1.0
-    
-    return source_prediction
-
-# --- TESTE DE SANIDADE ---
-
-def main():
-    key = jax.random.PRNGKey(0)
-    
-    model = DGASField(key)
-    
-    # Simular dados
-    dummy_mix = jax.random.normal(key, (128, 128, 2))
-    dummy_z = jax.random.normal(key, (128,)) 
-    
-    print("DGAS 3.2 Core Initialized.")
-    print("Running JIT Compilation & 1-Step Inference (Wait for XLA)...")
-    
-    # Primeira execução (compilação)
-    prediction = solve_single_step(model, dummy_mix, dummy_z)
-    
-    print(f"Output Shape: {prediction.shape}")
-    print("Status: SUCCESS. Neural Field is operative.")
-
-if __name__ == "__main__":
-    main()
