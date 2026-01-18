@@ -14,7 +14,7 @@ CONFIG = {
     "N_FFT": 2048,
     "HOP_LENGTH": 512,
     "LATENT_DIM": 128,
-    "BATCH_SIZE": 4,
+    "BATCH_SIZE": 32,
     "LEARNING_RATE": 3e-4,
     "WARMUP_STEPS": 1000,
     "TOTAL_STEPS": 100000,

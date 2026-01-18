@@ -121,8 +121,8 @@ class AudioLoader:
                 spec_mix = self._compute_spectrogram(mix_wav_aug)
                 spec_tgt = self._compute_spectrogram(vox_wav)
                 
-                spec_mix = spec_mix[:128, :128, :]
-                spec_tgt = spec_tgt[:128, :128, :]
+                spec_mix = spec_mix[:128, :, :]
+                spec_tgt = spec_tgt[:128, :, :]
                 
                 batch_mix.append(spec_mix)
                 batch_tgt.append(spec_tgt)
