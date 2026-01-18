@@ -9,7 +9,7 @@ from dgas_model import DGASField
 from dgas_data import AudioLoader
 
 CONFIG = {
-    "DATA_DIR": "/Volumes/DSAG DRIVE/raw_data/musdb18hq/train", # Caminho corrigido
+    "DATA_DIR": "/workspace/musdb18hq/train", # Caminho corrigido
     "SAMPLE_RATE": 44100,
     "N_FFT": 2048,
     "HOP_LENGTH": 512,

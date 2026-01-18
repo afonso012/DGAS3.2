@@ -11,8 +11,8 @@ from dgas_model import DGASField, LatentEncoder, MultiPeriodDiscriminator
 # === CONFIGURAÇÃO DE INFERÊNCIA ===
 CONFIG = {
     "CHECKPOINT": "dgas_stereo_step_20000.eqx",  # O teu checkpoint atual
-    "N_FFT": 1024,
-    "HOP_LENGTH": 256,
+    "N_FFT": 2048,
+    "HOP_LENGTH": 512,
     "CHUNK_SIZE": 5.0,    # Processar 5 segundos de cada vez (Save RAM)
     "OVERLAP": 0.5,       # Sobreposição para cross-fade suave
     "ODE_STEPS": 16,      # Qualidade vs Velocidade (16 é bom, 32 é estúdio, 64 é exagero)
