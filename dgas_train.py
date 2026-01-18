@@ -180,16 +180,30 @@ def train_step(models, opt_states, batch_mix, batch_target, key, step_num, optim
     return (gen, enc, disc), (new_opt_g, new_opt_d), g_loss, d_loss, aux
 
 def main():
-    print("=== DGAS 3.2: GOD TIER STEREO TRAINING ===")
+    print("=== DGAS 3.2: RESUMING TRAINING (SAVING MEMORY MODE) ===")
+    
+    # 1. Loader com Batch Size reduzido (definido na CONFIG)
     loader = AudioLoader(CONFIG["DATA_DIR"], CONFIG["BATCH_SIZE"])
     loader.start()
     
     try:
         key = jax.random.PRNGKey(42)
         k1, k2, k3 = jax.random.split(key, 3)
-        # Inicialização com canais corretos (Stereo=4)
+        
+        # Inicializar a estrutura do modelo
         models = (DGASField(k1), LatentEncoder(k2, input_channels=4), MultiPeriodDiscriminator(k3))
         
+        # --- NOVO: CARREGAR O CHECKPOINT 5000 ---
+        try:
+            print("Attempting to load checkpoint: dgas_stereo_step_20000.eqx ...")
+            models = eqx.tree_deserialise_leaves("dgas_stereo_step_20000.eqx", models)
+            print(">>> SUCESSO! Pesos carregados do Step 20000.")
+            start_step = 20001
+        except FileNotFoundError:
+            print(">>> Checkpoint não encontrado. A começar do ZERO.")
+            start_step = 0
+        # ----------------------------------------
+
         sched = optax.warmup_cosine_decay_schedule(0.0, CONFIG["LEARNING_RATE"], CONFIG["WARMUP_STEPS"], CONFIG["TOTAL_STEPS"])
         opt_g = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(learning_rate=sched))
         opt_d = optax.adamw(learning_rate=2e-4)
@@ -201,9 +215,9 @@ def main():
         
         print("Pipeline Ready. Waiting for data...")
         time.sleep(3)
-        print("TRAINING STARTED.")
+        print(f"RESUMING TRAINING FROM STEP {start_step}...")
         
-        for step in range(CONFIG["TOTAL_STEPS"]):
+        for step in range(start_step, CONFIG["TOTAL_STEPS"]):
             key, subkey = jax.random.split(key)
             batch_mix, batch_target = loader.get_batch()
             
@@ -212,11 +226,19 @@ def main():
             )
             
             if step % 10 == 0:
-                print(f"Step {step:05d} | G_Loss: {g_loss:.4f} (Phase: {aux[3]:.4f}) | D_Loss: {d_loss:.4f}")
+                 # Desempacotar as auxiliares para ver o log completo
+                l_flow, l_apml, l_adv, l_phase = aux
+                status = "WARMUP" if step < CONFIG["WARMUP_STEPS"] else "HYBRID"
+                
+                print(f"Step {step:05d} [{status}] | "
+                      f"G_Loss: {g_loss:.4f} "
+                      f"(Flow: {l_flow:.4f}, APML: {l_apml:.4f}, Phase: {l_phase:.4f}) | "
+                      f"D_Loss: {d_loss:.4f}")
             
             if step > 0 and step % 1000 == 0:
+                # Salvar novo checkpoint
                 eqx.tree_serialise_leaves(f"dgas_stereo_step_{step}.eqx", models)
-                print("Checkpoint saved.")
+                print(f"Checkpoint saved: dgas_stereo_step_{step}.eqx")
 
     except KeyboardInterrupt: print("Interrupted.")
     finally: loader.stop()
