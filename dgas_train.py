@@ -4,17 +4,18 @@ import equinox as eqx
 import optax
 import numpy as np
 import time
-from typing import Tuple
+import os
 from dgas_model import DGASField
 from dgas_data import AudioLoader
 
+# === CONFIGURAÇÃO EXTREMA (A100/H100 MODE) ===
 CONFIG = {
-    "DATA_DIR": "/workspace/musdb18hq/train", # Caminho corrigido
+    "DATA_DIR": "/workspace/musdb18hq/train",
     "SAMPLE_RATE": 44100,
     "N_FFT": 2048,
     "HOP_LENGTH": 512,
     "LATENT_DIM": 128,
-    "BATCH_SIZE": 32,
+    "BATCH_SIZE": 48,          # ALERTA: Requer 80GB VRAM. Se usares A40, muda para 12.
     "LEARNING_RATE": 3e-4,
     "WARMUP_STEPS": 1000,
     "TOTAL_STEPS": 100000,
@@ -23,11 +24,11 @@ CONFIG = {
     "PHASE_WEIGHT": 0.5,
 }
 
+# --- MODELOS AUXILIARES ---
 class LatentEncoder(eqx.Module):
     layers: list
     final_proj: eqx.nn.Linear
 
-    # CORREÇÃO: input_channels=4 para aceitar Stereo Complexo (L_Re, L_Im, R_Re, R_Im)
     def __init__(self, key, input_channels=4, latent_dim=128):
         keys = jax.random.split(key, 5)
         self.layers = [
@@ -51,7 +52,6 @@ class MultiPeriodDiscriminator(eqx.Module):
     layers: list
     def __init__(self, key):
         keys = jax.random.split(key, 4)
-        # Input channels=4 (Stereo)
         self.layers = [
             eqx.nn.Conv2d(4, 16, kernel_size=(3, 3), stride=(2, 2), key=keys[0]),
             jax.nn.leaky_relu,
@@ -68,17 +68,21 @@ def get_apml_mask(n_freq_bins, sample_rate):
     sensibilidade = 1.0 + 9.0 * jnp.exp(-0.5 * ((freqs - 3000) / 1000)**2)
     return sensibilidade[None, :, None]
 
+# --- FUNÇÕES DE PERDA ---
 def loss_fn_generator(generator_model, encoder_model, discriminator_model, batch_mix, batch_target, key, step_num):
-    B, T, F, C = batch_mix.shape # C será 4 agora
+    B, T, F, C = batch_mix.shape
     
+    # Encoder
     batch_mix_transposed = jnp.transpose(batch_mix, (0, 3, 1, 2))
     mix_flat = batch_mix_transposed.reshape(B, C, -1)
     z_batch = jax.vmap(encoder_model)(mix_flat)
     
+    # Robustez
     key_noise, key_flow = jax.random.split(key)
     z_noise = jax.random.normal(key_noise, z_batch.shape) * 0.1
     z_robust = z_batch + z_noise
     
+    # Flow Matching
     t_flow = jax.random.uniform(key_flow, (B, 1, 1, 1))
     x_t = (1 - t_flow) * batch_mix + t_flow * batch_target 
     target_velocity = batch_target - batch_mix
@@ -95,20 +99,16 @@ def loss_fn_generator(generator_model, encoder_model, discriminator_model, batch
 
     loss_flow = jnp.mean((predicted_velocity - target_velocity) ** 2)
     
+    # APML Loss
     apml_mask = get_apml_mask(F, CONFIG["SAMPLE_RATE"])
     error = (predicted_velocity - target_velocity)
     loss_apml = jnp.mean((error ** 2) * apml_mask)
 
-    # Phase Consistency Loss (Stereo Compatible)
+    # Phase Consistency Loss
     def get_phase_grad(spec):
-        # spec: (Batch, Time, Freq, 4) -> [L_Re, L_Im, R_Re, R_Im]
-        # Converter para complexo: (Batch, Time, Freq, 2) [Left_C, Right_C]
         left = spec[..., 0] + 1j * spec[..., 1]
         right = spec[..., 2] + 1j * spec[..., 3]
-        angle_l = jnp.angle(left)
-        angle_r = jnp.angle(right)
-        # Stack para calcular gradiente
-        angle = jnp.stack([angle_l, angle_r], axis=-1)
+        angle = jnp.stack([jnp.angle(left), jnp.angle(right)], axis=-1)
         return angle[:, 1:, :, :] - angle[:, :-1, :, :]
 
     pred_reconstructed = batch_mix + predicted_velocity
@@ -116,6 +116,7 @@ def loss_fn_generator(generator_model, encoder_model, discriminator_model, batch
     grad_target = get_phase_grad(batch_target)
     loss_phase = jnp.mean(jnp.abs(grad_pred - grad_target))
 
+    # GAN Loss
     progress = jnp.clip((step_num - CONFIG["WARMUP_STEPS"]) / CONFIG["TOTAL_STEPS"], 0.0, 1.0)
     lambda_adv = progress * CONFIG["GAN_WEIGHT_MAX"]
     
@@ -180,9 +181,9 @@ def train_step(models, opt_states, batch_mix, batch_target, key, step_num, optim
     return (gen, enc, disc), (new_opt_g, new_opt_d), g_loss, d_loss, aux
 
 def main():
-    print("=== DGAS 3.2: RESUMING TRAINING (SAVING MEMORY MODE) ===")
+    print("=== DGAS 3.2: TRAINING (HIGH PERFORMANCE MODE) ===")
     
-    # 1. Loader com Batch Size reduzido (definido na CONFIG)
+    # Inicialização do Loader
     loader = AudioLoader(CONFIG["DATA_DIR"], CONFIG["BATCH_SIZE"])
     loader.start()
     
@@ -190,19 +191,22 @@ def main():
         key = jax.random.PRNGKey(42)
         k1, k2, k3 = jax.random.split(key, 3)
         
-        # Inicializar a estrutura do modelo
         models = (DGASField(k1), LatentEncoder(k2, input_channels=4), MultiPeriodDiscriminator(k3))
         
-        # --- NOVO: CARREGAR O CHECKPOINT 5000 ---
-        try:
-            print("Attempting to load checkpoint: dgas_stereo_step_20000.eqx ...")
-            models = eqx.tree_deserialise_leaves("dgas_stereo_step_20000.eqx", models)
-            print(">>> SUCESSO! Pesos carregados do Step 20000.")
-            start_step = 20001
-        except FileNotFoundError:
-            print(">>> Checkpoint não encontrado. A começar do ZERO.")
-            start_step = 0
-        # ----------------------------------------
+        # Checkpoint Automático
+        possible_checkpoints = [f for f in os.listdir('.') if f.endswith('.eqx') and 'step' in f]
+        start_step = 0
+        
+        if possible_checkpoints:
+            # Encontrar o mais recente
+            latest = max(possible_checkpoints, key=lambda x: int(x.split('_step_')[1].split('.')[0]))
+            print(f">>> A carregar o último checkpoint: {latest}")
+            try:
+                models = eqx.tree_deserialise_leaves(latest, models)
+                start_step = int(latest.split('_step_')[1].split('.')[0]) + 1
+                print(f">>> Sucesso! A continuar do step {start_step}")
+            except:
+                print(">>> Erro ao carregar. A começar do zero.")
 
         sched = optax.warmup_cosine_decay_schedule(0.0, CONFIG["LEARNING_RATE"], CONFIG["WARMUP_STEPS"], CONFIG["TOTAL_STEPS"])
         opt_g = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(learning_rate=sched))
@@ -213,9 +217,8 @@ def main():
             opt_d.init(eqx.filter(models[2], eqx.is_array))
         )
         
-        print("Pipeline Ready. Waiting for data...")
-        time.sleep(3)
-        print(f"RESUMING TRAINING FROM STEP {start_step}...")
+        print("Pipeline Ready. Starting fast...")
+        time.sleep(1)
         
         for step in range(start_step, CONFIG["TOTAL_STEPS"]):
             key, subkey = jax.random.split(key)
@@ -226,19 +229,14 @@ def main():
             )
             
             if step % 10 == 0:
-                 # Desempacotar as auxiliares para ver o log completo
                 l_flow, l_apml, l_adv, l_phase = aux
                 status = "WARMUP" if step < CONFIG["WARMUP_STEPS"] else "HYBRID"
-                
-                print(f"Step {step:05d} [{status}] | "
-                      f"G_Loss: {g_loss:.4f} "
-                      f"(Flow: {l_flow:.4f}, APML: {l_apml:.4f}, Phase: {l_phase:.4f}) | "
-                      f"D_Loss: {d_loss:.4f}")
+                print(f"Step {step:05d} [{status}] | G: {g_loss:.4f} (Flow:{l_flow:.2f} APML:{l_apml:.2f}) | D: {d_loss:.4f}")
             
-            if step > 0 and step % 1000 == 0:
-                # Salvar novo checkpoint
+            if step > 0 and step % 2000 == 0:
                 eqx.tree_serialise_leaves(f"dgas_stereo_step_{step}.eqx", models)
-                print(f"Checkpoint saved: dgas_stereo_step_{step}.eqx")
+                print(f"Checkpoint saved: {step}")
+                # Limpeza de checkpoints antigos opcional aqui
 
     except KeyboardInterrupt: print("Interrupted.")
     finally: loader.stop()

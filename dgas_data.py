@@ -10,20 +10,22 @@ import os
 import pyloudnorm as pyln
 from typing import List, Tuple
 
-# --- CONFIGURAÇÃO DSP ---
+# --- CONFIGURAÇÃO DSP OTIMIZADA ---
 SAMPLE_RATE = 44100
 N_FFT = 2048
 HOP_LENGTH = 512
-CHUNK_DURATION = 3.0
+# Reduzido para 1.5s para aliviar o CPU e aumentar velocidade de carregamento
+CHUNK_DURATION = 1.5  
 CHUNK_SAMPLES = int(CHUNK_DURATION * SAMPLE_RATE)
 TARGET_LUFS = -24.0
+NUM_WORKERS = 8  # Fixo para máxima performance
 
 class AudioLoader:
-    def __init__(self, data_dir: str, batch_size: int = 4, queue_size: int = 20):
+    def __init__(self, data_dir: str, batch_size: int = 4, queue_size: int = 30):
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.track_folders = self._scan_musdb(data_dir)
-        self.meter = pyln.Meter(SAMPLE_RATE)
+        # Meter reiniciado em cada worker para evitar race conditions, não aqui
         
         if not self.track_folders:
             print(f"CRITICAL WARNING: No folders found in {data_dir}.")
@@ -32,7 +34,7 @@ class AudioLoader:
         
         self.queue = queue.Queue(maxsize=queue_size)
         self.running = False
-        self.worker_thread = None
+        self.workers = []
 
     def _scan_musdb(self, directory: str) -> List[str]:
         valid_folders = []
@@ -42,9 +44,9 @@ class AudioLoader:
                 valid_folders.append(root)
         return valid_folders
 
-    def _normalize_lufs(self, audio: np.ndarray) -> np.ndarray:
+    def _normalize_lufs(self, audio: np.ndarray, meter) -> np.ndarray:
         try:
-            loudness = self.meter.integrated_loudness(audio)
+            loudness = meter.integrated_loudness(audio)
             if loudness == -float('inf'): return audio
             delta = TARGET_LUFS - loudness
             if delta > 20: delta = 20
@@ -72,73 +74,69 @@ class AudioLoader:
                 pad = CHUNK_SAMPLES - mix.shape[0]
                 mix = np.pad(mix, ((0, pad), (0, 0)))
                 vox = np.pad(vox, ((0, pad), (0, 0)))
-            else:
-                mix = mix[:CHUNK_SAMPLES]
-                vox = vox[:CHUNK_SAMPLES]
             return mix, vox
-        except Exception as e:
-            print(f"Error: {e}")
+        except:
             return np.zeros((CHUNK_SAMPLES, 2)), np.zeros((CHUNK_SAMPLES, 2))
 
     def _augment_physics(self, mixture: np.ndarray) -> np.ndarray:
         if random.random() < 0.5:
             shift = random.randint(-10, 10)
             mixture = np.roll(mixture, shift, axis=0)
-        if random.random() < 0.3:
-            mixture = np.tanh(mixture * 1.5)
         return mixture
 
     def _compute_spectrogram(self, audio: np.ndarray) -> np.ndarray:
-        # Input Audio: (Samples, 2)
-        audio_T = audio.T # (2, Samples)
+        audio_T = audio.T 
         specs = []
         for ch in range(audio_T.shape[0]):
             stft = librosa.stft(audio_T[ch], n_fft=N_FFT, hop_length=HOP_LENGTH).T
-            # (Time, Freq, 2) -> Real/Imag
             specs.append(np.stack([stft.real, stft.imag], axis=-1))
         
-        # CORREÇÃO ESTÉREO: Stack em vez de Mean
-        # Resultado: (Time, Freq, 4) onde 4 = [L_Re, L_Im, R_Re, R_Im]
         spec_stereo = np.concatenate(specs, axis=-1)
         return spec_stereo.astype(np.float32)
 
     def _worker(self):
+        # Meter local para thread safety
+        local_meter = pyln.Meter(SAMPLE_RATE)
         while self.running:
             batch_mix, batch_tgt = [], []
             for _ in range(self.batch_size):
                 if not self.track_folders:
-                    batch_mix.append(np.zeros((128, 128, 4)))
-                    batch_tgt.append(np.zeros((128, 128, 4)))
+                    time.sleep(0.1)
                     continue
                 
                 folder = random.choice(self.track_folders)
                 mix_wav, vox_wav = self._load_chunk_pair(folder)
                 
-                mix_wav = self._normalize_lufs(mix_wav)
-                vox_wav = self._normalize_lufs(vox_wav)
+                # Otimização: Normalização rápida
+                mix_wav = self._normalize_lufs(mix_wav, local_meter)
+                vox_wav = self._normalize_lufs(vox_wav, local_meter)
                 mix_wav_aug = self._augment_physics(mix_wav.copy())
                 
                 spec_mix = self._compute_spectrogram(mix_wav_aug)
                 spec_tgt = self._compute_spectrogram(vox_wav)
                 
+                # Recorte para 128 frames (compatível com o modelo)
                 spec_mix = spec_mix[:128, :, :]
                 spec_tgt = spec_tgt[:128, :, :]
                 
                 batch_mix.append(spec_mix)
                 batch_tgt.append(spec_tgt)
             try:
+                # Timeout curto para verificar self.running frequentemente
                 self.queue.put((np.stack(batch_mix), np.stack(batch_tgt)), timeout=1)
             except queue.Full: continue
 
     def start(self):
         self.running = True
-        self.worker_thread = threading.Thread(target=self._worker, daemon=True)
-        self.worker_thread.start()
-        print("Data Loader Started (Stereo Mode).")
+        print(f"🚀 TURBO LOADER: Launching {NUM_WORKERS} workers...")
+        for _ in range(NUM_WORKERS):
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+            self.workers.append(t)
 
     def stop(self):
         self.running = False
-        if self.worker_thread: self.worker_thread.join()
+        for t in self.workers: t.join(timeout=1.0)
     
     def get_batch(self):
         mix, tgt = self.queue.get()
