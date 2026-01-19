@@ -10,7 +10,7 @@ from dgas_data import AudioLoader
 
 # === CONFIGURAÇÃO EXTREMA (A100/H100 MODE) ===
 CONFIG = {
-    "DATA_DIR": "/workspace/musdb18hq/train",
+    "DATA_DIR": "/workspace/train",
     "SAMPLE_RATE": 44100,
     "N_FFT": 2048,
     "HOP_LENGTH": 512,
