@@ -6,9 +6,21 @@ from typing import List
 # --- MÓDULO AUXILIAR ---
 class SinActivation(eqx.Module):
     def __call__(self, x):
+        # SIREN activation (Secção 3.2 do Relatório)
         return jnp.sin(30.0 * x)
 
-# --- 1. HASH GRID (Memória Espacial Rápida) ---
+# --- FUNÇÃO CRÍTICA: C2 CONTINUITY (Secção 3.1) ---
+def smoother_step(x):
+    """
+    Ken Perlin's Smootherstep function.
+    Garante continuidade da 1ª e 2ª derivada (C2).
+    Evita artefactos digitais e 'cliques' na fase.
+    Eq: 6x^5 - 15x^4 + 10x^3
+    """
+    x = jnp.clip(x, 0.0, 1.0)
+    return x * x * x * (x * (x * 6 - 15) + 10)
+
+# --- 1. HASH GRID C2-CONTINUOUS ---
 class ContinuousHashGrid(eqx.Module):
     embeddings: jnp.ndarray
     resolution: int
@@ -26,7 +38,9 @@ class ContinuousHashGrid(eqx.Module):
         x0 = jnp.floor(x_scaled).astype(jnp.int32)
         x1 = x0 + 1
         
-        weights = x_scaled - x0
+        # --- CORREÇÃO DGAS 3.1: USAR SMOOTHERSTEP EM VEZ DE LINEAR ---
+        # Isto implementa a interpolação polinomial exigida no relatório
+        weights = smoother_step(x_scaled - x0) 
         
         primes = jnp.array([1, 2654435761], dtype=jnp.uint32)
         def get_hash(coords):
@@ -42,11 +56,12 @@ class ContinuousHashGrid(eqx.Module):
         v10 = self.embeddings[idx10]
         v11 = self.embeddings[idx11]
 
+        # Interpolação Bilinear com pesos C2 (Smooth)
         h0 = v00 * (1 - weights[1]) + v01 * weights[1]
         h1 = v10 * (1 - weights[1]) + v11 * weights[1]
         return h0 * (1 - weights[0]) + h1 * weights[0]
 
-# --- 2. MODULAÇÃO FiLM ---
+# --- 2. MODULAÇÃO FiLM (Secção 3.2) ---
 class FiLMLayer(eqx.Module):
     linear: eqx.nn.Linear
     
@@ -55,9 +70,10 @@ class FiLMLayer(eqx.Module):
         
     def __call__(self, x, gamma, beta):
         out = self.linear(x)
+        # Modulação Afim: Feature-wise Linear Modulation
         return (1.0 + gamma) * out + beta
 
-# --- 3. VECTOR FIELD (Rectified Flow Motor) ---
+# --- 3. VECTOR FIELD (Rectified Flow Engine) ---
 class DGASField(eqx.Module):
     grids: List[ContinuousHashGrid]
     layers: List[FiLMLayer]
@@ -69,13 +85,15 @@ class DGASField(eqx.Module):
         keys = jax.random.split(key, 10)
         self.hidden_dim = hidden_dim
         
+        # Multi-Resolução para capturar detalhes finos e globais
         self.grids = [
             ContinuousHashGrid(keys[0], resolution=16),
             ContinuousHashGrid(keys[1], resolution=64),
             ContinuousHashGrid(keys[2], resolution=256)
         ]
         
-        in_dim = 16 * 3 + 3
+        # 16*3 (Grids) + 2 (Espacial) + 1 (Tempo Difusão) = 51
+        in_dim = 16 * 3 + 3  
         
         self.layers = [
             FiLMLayer(keys[3], in_dim, hidden_dim),
@@ -84,6 +102,7 @@ class DGASField(eqx.Module):
             FiLMLayer(keys[6], hidden_dim, hidden_dim)
         ]
         
+        # Mapeia o Latente Z para os parâmetros FiLM (Gamma, Beta)
         self.to_film = eqx.nn.Linear(latent_dim, 2 * 4 * hidden_dim, key=keys[7])
         self.final = eqx.nn.Linear(hidden_dim, 4, key=keys[8]) 
 
@@ -97,11 +116,11 @@ class DGASField(eqx.Module):
         for i, layer in enumerate(self.layers):
             gamma, beta = film_params[i]
             h = layer(h, gamma, beta)
-            h = jnp.sin(30.0 * h) # SIREN Activation
+            h = jnp.sin(30.0 * h) # SIREN Activation (Secção 3.2)
             
         return self.final(h)
 
-# --- 4. ENCODER ---
+# --- 4. ENCODER LATENTE ---
 class LatentEncoder(eqx.Module):
     layers: List[eqx.nn.Conv2d]
     final: eqx.nn.Linear

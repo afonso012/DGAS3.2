@@ -16,7 +16,7 @@ TARGET_LUFS = -24.0
 NUM_WORKERS = 8 
 
 class AudioLoader:
-    def __init__(self, data_dir: str, batch_size: int = 32, queue_size: int = 40):
+    def __init__(self, data_dir: str, batch_size: int = 16, queue_size: int = 40):
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.track_folders = self._scan_musdb(data_dir)
