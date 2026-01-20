@@ -9,7 +9,7 @@ from tqdm import tqdm
 from dgas_model import Generator, Discriminator
 
 CONFIG = {
-    "CHECKPOINT": "checkpoints/dgas_latest.eqx", 
+    "CHECKPOINT": "checkpoints/dgas_test.eqx", 
     "N_FFT": 2048,
     "HOP_LENGTH": 512,
     "CHUNK_SIZE": 5.0,
@@ -138,4 +138,4 @@ def process_file(file_path, model):
 
 if __name__ == "__main__":
     generator = load_models()
-    # process_file("input.wav", generator)
+    process_file("mixture.wav", generator)

@@ -12,14 +12,14 @@ CONFIG = {
     "DATA_DIR": "/workspace/musdb18hq/train",
     "CHECKPOINT_DIR": "checkpoints",
     "SAVE_INTERVAL": 1000,
-    "BATCH_SIZE": 8,       
+    "BATCH_SIZE": 24,       
     "STEPS": 1000000,
     "WARMUP_STEPS": 5000, 
     "N_FFT": 2048, "HOP_LENGTH": 512,
     
     "LAMBDA_FLOW": 10.0,
-    "LAMBDA_MRSTFT": 5.0,
-    "LAMBDA_ADV": 1.0,     
+    "LAMBDA_MRSTFT": 10.0,  # Aumenta o foco na qualidade de áudio
+    "LAMBDA_ADV": 0.05,   
     "LAMBDA_R1": 10.0,   
     "R1_INTERVAL": 16,    
 }
@@ -50,18 +50,43 @@ def stft_loss_fn(mag_pred, mag_target):
     log_loss = jnp.mean(jnp.abs(jnp.log1p(mag_pred) - jnp.log1p(mag_target)))
     return sc_loss + log_loss
 
+def safe_avg_pool(x, window_shape, strides):
+    # Otimização A100: Calcular count apenas espacialmente (1, 1, F, T)
+    # Evita que o XLA tente fazer constant-folding de tensores gigantes (Batch*Chan)
+    B, C, F, T = x.shape
+    
+    # 1. Soma os valores (mantém shape original B,C,F',T')
+    val = jax.lax.reduce_window(x, 0.0, jax.lax.add, window_shape, strides, 'SAME')
+    
+    # 2. Cria ones apenas espacial (muito mais leve para o compilador)
+    ones_spatial = jnp.ones((1, 1, F, T))
+    
+    # 3. Calcula count espacial
+    count = jax.lax.reduce_window(ones_spatial, 0.0, jax.lax.add, window_shape, strides, 'SAME')
+    
+    # JAX faz broadcast automático na divisão: (B,C,F',T') / (1,1,F',T')
+    return val / (count + 1e-6)
+
+# --- FUNÇÃO DE LOSS CORRIGIDA ---
 def compute_mrstft_loss(pred_complex, target_complex):
-    m_pred = complex_mag(pred_complex)
-    m_target = complex_mag(target_complex)
+    m_pred = complex_mag(pred_complex)     # Shape: (B, 2, F, T)
+    m_target = complex_mag(target_complex) # Shape: (B, 2, F, T)
+    
+    # Scale 1: Full Resolution
     loss_1 = stft_loss_fn(m_pred, m_target)
     
-    p_t = jax.nn.avg_pool(m_pred, window_shape=(1, 1, 1, 4), strides=(1, 1, 1, 2), padding='SAME')
-    t_t = jax.nn.avg_pool(m_target, window_shape=(1, 1, 1, 4), strides=(1, 1, 1, 2), padding='SAME')
+    # Scale 2: Pooling Time (Downsample T por 2)
+    # Janela (1, 1, 1, 4) -> (Batch, Channel, Freq, Time)
+    p_t = safe_avg_pool(m_pred, (1, 1, 1, 4), (1, 1, 1, 2))
+    t_t = safe_avg_pool(m_target, (1, 1, 1, 4), (1, 1, 1, 2))
     loss_2 = stft_loss_fn(p_t, t_t)
     
-    p_f = jax.nn.avg_pool(m_pred, window_shape=(1, 1, 4, 1), strides=(1, 1, 2, 1), padding='SAME')
-    t_f = jax.nn.avg_pool(m_target, window_shape=(1, 1, 4, 1), strides=(1, 1, 2, 1), padding='SAME')
+    # Scale 3: Pooling Freq (Downsample F por 2)
+    # Janela (1, 1, 4, 1) -> (Batch, Channel, Freq, Time)
+    p_f = safe_avg_pool(m_pred, (1, 1, 4, 1), (1, 1, 2, 1))
+    t_f = safe_avg_pool(m_target, (1, 1, 4, 1), (1, 1, 2, 1))
     loss_3 = stft_loss_fn(p_f, t_f)
+    
     return loss_1 + loss_2 + loss_3
 
 def gpu_stft(audio):
