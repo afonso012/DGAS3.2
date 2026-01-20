@@ -17,7 +17,7 @@ class AudioLoader:
         self.data_dir = data_dir
         self.batch_size = batch_size
         self.track_folders = self._scan_musdb(data_dir)
-        self.queue = queue.Queue(maxsize=40)
+        self.queue = queue.Queue(maxsize=100) # Era 40
         self.running = False
         print(f"Dataset: {len(self.track_folders)} faixas.")
 

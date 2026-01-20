@@ -19,7 +19,6 @@ class SinusoidalEmbedding(eqx.Module):
         half_dim = embedding_dim // 2
         self.frequencies = jnp.exp(jnp.linspace(0, jnp.log(max_freq), half_dim))
     def __call__(self, x):
-        # x deve ser escalar ou shape ()
         args = x * self.frequencies
         return jnp.concatenate([jnp.sin(args), jnp.cos(args)])
 
@@ -36,6 +35,10 @@ class ContinuousHashGrid(eqx.Module):
         self.embeddings = jax.random.uniform(key, (grid_size, output_dim), minval=-limit, maxval=limit)
 
     def __call__(self, x):
+        # CORREÇÃO B: CLIP OBRIGATÓRIO
+        # Impede que coordenadas <0 ou >1 causem wrap-around no hash
+        x = jnp.clip(x, 0.0, 1.0)
+        
         x_scaled = x * self.resolution
         x0 = jnp.floor(x_scaled).astype(jnp.int32)
         x1 = x0 + 1
@@ -66,7 +69,7 @@ class FiLMLayer(eqx.Module):
 class DGASField(eqx.Module):
     grids: List[ContinuousHashGrid]
     time_embed: SinusoidalEmbedding
-    freq_embed: SinusoidalEmbedding # NOVO: Positional Encoding para Frequência
+    freq_embed: SinusoidalEmbedding 
     layers: List[FiLMLayer]
     to_film: eqx.nn.Linear
     val_proj: eqx.nn.Linear 
@@ -83,13 +86,10 @@ class DGASField(eqx.Module):
             ContinuousHashGrid(keys[2], resolution=256)
         ]
         
-        # Embeddings
         self.time_embed = SinusoidalEmbedding(32)
-        self.freq_embed = SinusoidalEmbedding(32) # Encoding extra para eixo Freq
-        
+        self.freq_embed = SinusoidalEmbedding(32)
         self.val_proj = eqx.nn.Linear(4, 32, key=keys[10])
 
-        # Input: Grids(16*3) + Coords(2) + Time(32) + Freq(32) + Signal(32)
         in_dim = 48 + 2 + 32 + 32 + 32
         
         self.layers = [
@@ -103,18 +103,16 @@ class DGASField(eqx.Module):
         self.final = eqx.tree_at(lambda l: l.weight, self.final, self.final.weight * 0.01)
 
     def __call__(self, t, x_pos, x_val, cond):
-        # x_pos = [time_coord, freq_coord] (normalizados 0-1)
-        t_emb = self.time_embed(t)
+        # Clip adicional por segurança
+        x_pos = jnp.clip(x_pos, 0.0, 1.0)
         
-        # MELHORIA: Contexto global de frequência
+        t_emb = self.time_embed(t)
         f_coord = x_pos[1] 
         f_emb = self.freq_embed(f_coord)
-        
         val_emb = self.val_proj(x_val)
         
         grid_feats = [g(x_pos) for g in self.grids]
         
-        # Concatena tudo
         h = jnp.concatenate(grid_feats + [x_pos, t_emb, f_emb, val_emb], axis=0)
         
         film_params = self.to_film(cond).reshape(4, 2, self.hidden_dim)
@@ -124,7 +122,7 @@ class DGASField(eqx.Module):
             h = jnp.sin(30.0 * h) 
         return self.final(h)
 
-# --- NETWORKS ---
+# --- NETWORKS (Inalterado) ---
 class LatentEncoder(eqx.Module):
     layers: List[eqx.nn.Conv2d]
     final: eqx.nn.Linear
@@ -147,12 +145,11 @@ class Discriminator(eqx.Module):
     final: eqx.nn.Linear
     def __init__(self, key):
         keys = jax.random.split(key, 5)
-        # Discriminador mais profundo para capturar detalhes finos e globais
         self.layers = [
-            eqx.nn.Conv2d(8, 32, 3, stride=2, key=keys[0]),  # 1024 -> 512
-            eqx.nn.Conv2d(32, 64, 3, stride=2, key=keys[1]), # 512 -> 256
-            eqx.nn.Conv2d(64, 128, 3, stride=2, key=keys[2]), # 256 -> 128
-            eqx.nn.Conv2d(128, 256, 3, stride=2, key=keys[3]), # 128 -> 64
+            eqx.nn.Conv2d(8, 32, 3, stride=2, key=keys[0]),
+            eqx.nn.Conv2d(32, 64, 3, stride=2, key=keys[1]),
+            eqx.nn.Conv2d(64, 128, 3, stride=2, key=keys[2]),
+            eqx.nn.Conv2d(128, 256, 3, stride=2, key=keys[3]),
         ]
         self.final = eqx.nn.Linear(256, 1, key=keys[4])
     def __call__(self, x, cond):

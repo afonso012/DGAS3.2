@@ -23,64 +23,77 @@ def load_models():
     key = jax.random.PRNGKey(0)
     k1, k2 = jax.random.split(key)
     gen = Generator(key=k1)
-    disc = Discriminator(key=k2)
-    models = (gen, disc)
+    models = (gen, Discriminator(key=k2))
     try:
         models = eqx.tree_deserialise_leaves(CONFIG['CHECKPOINT'], models)
-        print(">>> Pesos carregados com SUCESSO.")
-        return models[0] # Return generator
+        return models[0]
     except FileNotFoundError:
         raise FileNotFoundError(f"Erro: Checkpoint não encontrado!")
 
+# --- JAX SIGNAL PROCESSING (GPU) ---
+def gpu_stft_inference(audio):
+    # Shape Input: (B=1, Channels, Samples)
+    window = jnp.hanning(CONFIG["N_FFT"])
+    f, t, Zxx = jax.scipy.signal.stft(audio, fs=44100, window=window, nperseg=CONFIG["N_FFT"], noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"])
+    Zxx = jnp.transpose(Zxx, (0, 1, 2, 3))
+    # Output: (B, C, F, T, 2) -> (B, 2*C, F, T)
+    spec = jnp.stack([Zxx.real, Zxx.imag], axis=-1)
+    B, C, F, T, _ = spec.shape
+    return jnp.transpose(spec, (0, 1, 4, 2, 3)).reshape(B, C * 2, F, T)
+
+def gpu_istft_inference(spec):
+    # Input: (B, 4, F, T) -> De volta para audio
+    # Reconstruir complexos
+    # L: canais 0 (real), 1 (imag) | R: canais 2 (real), 3 (imag)
+    l_complex = spec[:, 0] + 1j * spec[:, 1]
+    r_complex = spec[:, 2] + 1j * spec[:, 3]
+    
+    window = jnp.hanning(CONFIG["N_FFT"])
+    # jax.scipy.signal.istft existe nas versões recentes
+    _, audio_l = jax.scipy.signal.istft(l_complex, fs=44100, window=window, nperseg=CONFIG["N_FFT"], noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"])
+    _, audio_r = jax.scipy.signal.istft(r_complex, fs=44100, window=window, nperseg=CONFIG["N_FFT"], noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"])
+    
+    return jnp.stack([audio_l, audio_r], axis=1)
+
+def get_log_coords(F, T):
+    times = jnp.linspace(0, 1, T)
+    linear_freqs = jnp.linspace(0, 1, F)
+    log_freqs = jnp.log1p(linear_freqs * 10.0) / jnp.log1p(10.0)
+    return log_freqs, times
+
 @eqx.filter_jit
-def predict_step(model, mix_spec, key, steps):
-    # mix_spec: (B, C, F, T)
+def predict_chunk(model, audio_chunk, key, steps):
+    # 1. GPU STFT
+    mix_spec = gpu_stft_inference(audio_chunk) # (1, 4, F, T)
     
-    # 1. Codificar o condicional
-    cond = jax.vmap(model.encoder)(mix_spec) # (B, Latent)
-    
+    cond = jax.vmap(model.encoder)(mix_spec) 
     x = jax.random.normal(key, mix_spec.shape)
     dt = 1.0 / steps
     
     B, C, F, T = mix_spec.shape
-    freqs = jnp.linspace(0, 1, F)
-    times = jnp.linspace(0, 1, T)
+    freqs, times = get_log_coords(F, T)
     grid_f, grid_t = jnp.meshgrid(freqs, times, indexing='ij')
     f_flat, t_flat = grid_f.flatten(), grid_t.flatten()
     
-    # Função auxiliar para processar 1 item do batch
     def get_velocity_single(t_curr, x_curr, cond_curr):
-        x_flat = jnp.transpose(x_curr, (1, 2, 0)).reshape(-1, 4) # (F*T, 4)
-        
-        # vmap sobre as posições (F, T)
+        x_flat = jnp.transpose(x_curr, (1, 2, 0)).reshape(-1, 4)
         def field_point(f_val, t_val, x_val_i):
             return model.field(t_curr, jnp.array([t_val, f_val]), x_val_i, cond_curr)
-            
         v_flat = jax.vmap(field_point)(f_flat, t_flat, x_flat)
-        return jnp.transpose(v_flat.reshape(F, T, 4), (2, 0, 1)) # (4, F, T)
+        return jnp.transpose(v_flat.reshape(F, T, 4), (2, 0, 1))
 
     def loop_body(i, curr_x):
         t = i / steps
-        # vmap do get_velocity sobre o Batch
         d1 = jax.vmap(get_velocity_single, in_axes=(None, 0, 0))(t, curr_x, cond)
-        
         x_tilde = curr_x + d1 * dt
-        
         d2 = jax.vmap(get_velocity_single, in_axes=(None, 0, 0))(t + dt, x_tilde, cond)
-        
         curr_x = curr_x + (d1 + d2) * 0.5 * dt
         return curr_x
 
-    return jax.lax.fori_loop(0, steps, loop_body, x)
-
-def spectrogram_to_audio(spec_chunk):
-    l_re, l_im = spec_chunk[0], spec_chunk[1]
-    r_re, r_im = spec_chunk[2], spec_chunk[3]
-    l_complex = l_re + 1j * l_im
-    r_complex = r_re + 1j * r_im
-    audio_l = librosa.istft(np.array(l_complex), hop_length=CONFIG["HOP_LENGTH"], n_fft=CONFIG["N_FFT"])
-    audio_r = librosa.istft(np.array(r_complex), hop_length=CONFIG["HOP_LENGTH"], n_fft=CONFIG["N_FFT"])
-    return np.stack([audio_l, audio_r])
+    final_spec = jax.lax.fori_loop(0, steps, loop_body, x)
+    
+    # 2. GPU ISTFT
+    return gpu_istft_inference(final_spec)
 
 def process_file(file_path, model):
     print(f"\n>>> A processar: {file_path}")
@@ -91,41 +104,38 @@ def process_file(file_path, model):
     chunk_samples = int(CONFIG["CHUNK_SIZE"] * sr)
     hop_samples = int(chunk_samples * (1 - CONFIG["OVERLAP"]))
     
+    # Prepara buffers
     output_buffer = np.zeros_like(audio)
     weight_buffer = np.zeros(total_samples)
     window = np.hanning(chunk_samples)
     
     key = jax.random.PRNGKey(42)
     
-    # Processamento Batch=1 (padrão para CPU/memória)
     for i in tqdm(range(0, total_samples - chunk_samples + 1, hop_samples)):
         chunk = audio[:, i : i + chunk_samples]
-        l_stft = librosa.stft(chunk[0], n_fft=CONFIG["N_FFT"], hop_length=CONFIG["HOP_LENGTH"])
-        r_stft = librosa.stft(chunk[1], n_fft=CONFIG["N_FFT"], hop_length=CONFIG["HOP_LENGTH"])
         
-        # (1, 4, F, T)
-        spec_input = np.stack([l_stft.real, l_stft.imag, r_stft.real, r_stft.imag])
-        spec_input_jax = jnp.array(spec_input)[None, ...] 
+        # Envia para GPU como JAX Array (B=1, C, Samples)
+        chunk_jax = jnp.array(chunk)[None, ...]
         
         key, subkey = jax.random.split(key)
         
-        # Chama predict_step que agora lida com batch corretamente
-        predicted_spec = predict_step(model, spec_input_jax, subkey, CONFIG["ODE_STEPS"])
-        predicted_spec = np.array(predicted_spec[0]) 
+        # O modelo faz STFT -> Flow -> ISTFT tudo na GPU
+        rec_audio_jax = predict_chunk(model, chunk_jax, subkey, CONFIG["ODE_STEPS"])
         
-        rec_audio = spectrogram_to_audio(predicted_spec)
+        # Traz de volta para CPU só o áudio final
+        rec_audio = np.array(rec_audio_jax[0])
+        
         valid_len = min(rec_audio.shape[1], chunk_samples)
-        
         output_buffer[:, i : i + valid_len] += rec_audio[:, :valid_len] * window[:valid_len]
         weight_buffer[i : i + valid_len] += window[:valid_len]
 
     weight_buffer[weight_buffer < 1e-8] = 1.0
     output_buffer /= weight_buffer
     
-    out_name = file_path.rsplit('.', 1)[0] + "_DGAS_OUT.wav"
+    out_name = file_path.rsplit('.', 1)[0] + "_DGAS_A100.wav"
     sf.write(out_name, output_buffer.T, sr)
     print(f"✅ Salvo: {out_name}")
 
 if __name__ == "__main__":
     generator = load_models()
-    # Exemplo: process_file("input.wav", generator)
+    # process_file("input.wav", generator)
