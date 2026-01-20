@@ -13,13 +13,14 @@ def siren_init(weight: jnp.ndarray, key, w0=30.0):
     limit = jnp.sqrt(6 / in_dim) / w0
     return jax.random.uniform(key, (out_dim, in_dim), minval=-limit, maxval=limit)
 
-class SinusoidalTimeEmbedding(eqx.Module):
+class SinusoidalEmbedding(eqx.Module):
     frequencies: jnp.ndarray
-    def __init__(self, embedding_dim: int):
+    def __init__(self, embedding_dim: int, max_freq: float = 1000.0):
         half_dim = embedding_dim // 2
-        self.frequencies = jnp.exp(jnp.linspace(0, jnp.log(1000.0), half_dim))
-    def __call__(self, t):
-        args = t * self.frequencies
+        self.frequencies = jnp.exp(jnp.linspace(0, jnp.log(max_freq), half_dim))
+    def __call__(self, x):
+        # x deve ser escalar ou shape ()
+        args = x * self.frequencies
         return jnp.concatenate([jnp.sin(args), jnp.cos(args)])
 
 # --- HASH GRID & LAYERS ---
@@ -28,7 +29,6 @@ class ContinuousHashGrid(eqx.Module):
     resolution: int
     grid_size: int
 
-    # SOTA: Hash Grid expandido para 16k (16384) para reduzir colisões
     def __init__(self, key, resolution=128, grid_size=16384, output_dim=16):
         self.resolution = resolution
         self.grid_size = grid_size
@@ -65,29 +65,32 @@ class FiLMLayer(eqx.Module):
 
 class DGASField(eqx.Module):
     grids: List[ContinuousHashGrid]
-    time_embed: SinusoidalTimeEmbedding
+    time_embed: SinusoidalEmbedding
+    freq_embed: SinusoidalEmbedding # NOVO: Positional Encoding para Frequência
     layers: List[FiLMLayer]
     to_film: eqx.nn.Linear
-    val_proj: eqx.nn.Linear # Nova projeção para x_val
+    val_proj: eqx.nn.Linear 
     final: eqx.nn.Linear
     hidden_dim: int
     
     def __init__(self, key, hidden_dim=256, latent_dim=128):
-        keys = jax.random.split(key, 12)
+        keys = jax.random.split(key, 15)
         self.hidden_dim = hidden_dim
-        # Grids com resoluções progressivas
+        
         self.grids = [
             ContinuousHashGrid(keys[0], resolution=16),
             ContinuousHashGrid(keys[1], resolution=64),
             ContinuousHashGrid(keys[2], resolution=256)
         ]
-        self.time_embed = SinusoidalTimeEmbedding(32)
         
-        # SOTA: Projeção do valor do sinal ruidoso (4 canais: Re/Im L/R)
+        # Embeddings
+        self.time_embed = SinusoidalEmbedding(32)
+        self.freq_embed = SinusoidalEmbedding(32) # Encoding extra para eixo Freq
+        
         self.val_proj = eqx.nn.Linear(4, 32, key=keys[10])
 
-        # Dimensão de entrada ajustada: Grids + Coords(2) + Time(32) + Signal_Value(32)
-        in_dim = 16 * 3 + 2 + 32 + 32
+        # Input: Grids(16*3) + Coords(2) + Time(32) + Freq(32) + Signal(32)
+        in_dim = 48 + 2 + 32 + 32 + 32
         
         self.layers = [
             FiLMLayer(keys[3], in_dim, hidden_dim),
@@ -99,16 +102,20 @@ class DGASField(eqx.Module):
         self.final = eqx.nn.Linear(hidden_dim, 4, key=keys[8])
         self.final = eqx.tree_at(lambda l: l.weight, self.final, self.final.weight * 0.01)
 
-    # SOTA: Re-acoplamento de x_t (x_val)
-    # O campo vetorial agora depende do valor atual da partícula, não apenas da posição
     def __call__(self, t, x_pos, x_val, cond):
+        # x_pos = [time_coord, freq_coord] (normalizados 0-1)
         t_emb = self.time_embed(t)
-        val_emb = self.val_proj(x_val) # Incorporar o sinal ruidoso
+        
+        # MELHORIA: Contexto global de frequência
+        f_coord = x_pos[1] 
+        f_emb = self.freq_embed(f_coord)
+        
+        val_emb = self.val_proj(x_val)
         
         grid_feats = [g(x_pos) for g in self.grids]
         
-        # Concatenar tudo: Features Espaciais + Posição + Tempo + Valor do Sinal
-        h = jnp.concatenate(grid_feats + [x_pos, t_emb, val_emb], axis=0)
+        # Concatena tudo
+        h = jnp.concatenate(grid_feats + [x_pos, t_emb, f_emb, val_emb], axis=0)
         
         film_params = self.to_film(cond).reshape(4, 2, self.hidden_dim)
         for i, layer in enumerate(self.layers):
@@ -117,7 +124,7 @@ class DGASField(eqx.Module):
             h = jnp.sin(30.0 * h) 
         return self.final(h)
 
-# --- 4. NETWORKS ---
+# --- NETWORKS ---
 class LatentEncoder(eqx.Module):
     layers: List[eqx.nn.Conv2d]
     final: eqx.nn.Linear
@@ -140,14 +147,16 @@ class Discriminator(eqx.Module):
     final: eqx.nn.Linear
     def __init__(self, key):
         keys = jax.random.split(key, 5)
+        # Discriminador mais profundo para capturar detalhes finos e globais
         self.layers = [
-            eqx.nn.Conv2d(8, 32, 3, stride=2, key=keys[0]),
-            eqx.nn.Conv2d(32, 64, 3, stride=2, key=keys[1]),
-            eqx.nn.Conv2d(64, 128, 3, stride=2, key=keys[2]),
+            eqx.nn.Conv2d(8, 32, 3, stride=2, key=keys[0]),  # 1024 -> 512
+            eqx.nn.Conv2d(32, 64, 3, stride=2, key=keys[1]), # 512 -> 256
+            eqx.nn.Conv2d(64, 128, 3, stride=2, key=keys[2]), # 256 -> 128
+            eqx.nn.Conv2d(128, 256, 3, stride=2, key=keys[3]), # 128 -> 64
         ]
-        self.final = eqx.nn.Linear(128, 1, key=keys[3])
+        self.final = eqx.nn.Linear(256, 1, key=keys[4])
     def __call__(self, x, cond):
-        h = jnp.concatenate([x, cond], axis=0) # 4+4=8 canais input
+        h = jnp.concatenate([x, cond], axis=0)
         for layer in self.layers: h = jax.nn.leaky_relu(layer(h), negative_slope=0.2)
         h = jnp.mean(h, axis=(1, 2))
         return self.final(h)
@@ -159,7 +168,6 @@ class Generator(eqx.Module):
         k1, k2 = jax.random.split(key)
         self.encoder = LatentEncoder(k1)
         self.field = DGASField(k2)
-    # Atualizado para passar x_val (mix_spec ou noisy spec) para o field
     def __call__(self, t, x_pos, x_val, mix_spec):
         z = self.encoder(mix_spec)
         return self.field(t, x_pos, x_val, z)
