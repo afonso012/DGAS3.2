@@ -15,7 +15,7 @@ CONFIG = {
     "CHECKPOINT": "checkpoints/dgas_test.eqx", 
     "N_FFT": 2048,
     "HOP_LENGTH": 512,
-    "CHUNK_SIZE": 1.5,   # IMPORTANTE: 1.5s igual ao treino
+    "CHUNK_SIZE": 1.5,   # Igual ao treino
     "OVERLAP": 0.5,
     "ODE_STEPS": 32, 
     "TARGET_SR": 44100
@@ -33,13 +33,11 @@ def load_models():
     except FileNotFoundError:
         raise FileNotFoundError(f"Erro: Checkpoint não encontrado em {CONFIG['CHECKPOINT']}")
 
-# --- STFT/ISTFT HÍBRIDO (JAX CPU -> JAX GPU) ---
+# --- FUNÇÕES STFT/ISTFT NO CPU (Manual JIT) ---
 
-# Definimos a função normalmente (sem decorador aqui)
 def cpu_stft_jax_impl(audio):
     # audio: (1, 2, N) -> Batch, Channels, Samples
     window = jnp.hanning(CONFIG["N_FFT"])
-    
     f, t, Zxx = jax.scipy.signal.stft(
         audio, 
         fs=44100, 
@@ -47,25 +45,20 @@ def cpu_stft_jax_impl(audio):
         nperseg=CONFIG["N_FFT"], 
         noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"]
     )
-    
-    # Converter para formato do modelo: (B, 4, F, T) -> [L_real, L_imag, R_real, R_imag]
-    spec = jnp.stack([Zxx.real, Zxx.imag], axis=-1) # (1, 2, F, T, 2)
-    spec = jnp.transpose(spec, (0, 1, 4, 2, 3))     # (1, 2, 2, F, T)
-    
+    # Formatar para (B, 4, F, T)
+    spec = jnp.stack([Zxx.real, Zxx.imag], axis=-1)
+    spec = jnp.transpose(spec, (0, 1, 4, 2, 3))
     B, C, _, F, T = spec.shape
     return spec.reshape(B, C * 2, F, T)
 
-# Aplicamos o JIT com backend CPU explicitamente
+# Compilação manual para CPU
 cpu_stft_jax = jax.jit(cpu_stft_jax_impl, backend='cpu')
-
 
 def cpu_istft_jax_impl(spec):
     # spec: (1, 4, F, T)
     B, _, F, T = spec.shape
     spec = spec.reshape(B, 2, 2, F, T)
-    
-    Zxx = spec[:, :, 0] + 1j * spec[:, :, 1] # (1, 2, F, T)
-    
+    Zxx = spec[:, :, 0] + 1j * spec[:, :, 1]
     window = jnp.hanning(CONFIG["N_FFT"])
     _, audio = jax.scipy.signal.istft(
         Zxx, 
@@ -74,11 +67,10 @@ def cpu_istft_jax_impl(spec):
         nperseg=CONFIG["N_FFT"], 
         noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"]
     )
-    return audio # (1, 2, N)
+    return audio
 
-# Aplicamos o JIT com backend CPU explicitamente
+# Compilação manual para CPU
 cpu_istft_jax = jax.jit(cpu_istft_jax_impl, backend='cpu')
-
 
 def get_log_coords(F, T):
     times = jnp.linspace(0, 1, T)
@@ -86,10 +78,10 @@ def get_log_coords(F, T):
     log_freqs = jnp.log1p(linear_freqs * 10.0) / jnp.log1p(10.0)
     return log_freqs, times
 
-# --- MODEL INFERENCE (GPU) ---
+# --- INFERÊNCIA DO MODELO NA GPU ---
+
 @eqx.filter_jit
 def predict_spectrogram(model, mix_spec, key, steps):
-    # mix_spec: (1, 4, F, T)
     cond = jax.vmap(model.encoder)(mix_spec) 
     x = jax.random.normal(key, mix_spec.shape)
     dt = 1.0 / steps
@@ -100,15 +92,13 @@ def predict_spectrogram(model, mix_spec, key, steps):
     f_flat, t_flat = grid_f.flatten(), grid_t.flatten()
     
     def get_velocity_single(t_curr, x_curr, cond_curr):
-        # x_curr: (4, F, T)
-        # Transpose para (F, T, 4) para alinhar com grid_f/grid_t
+        # x_curr: (4, F, T) -> Transpose para (F, T, 4)
         x_flat = jnp.transpose(x_curr, (1, 2, 0)).reshape(-1, 4)
         
         def field_point(f_val, t_val, x_val_i):
             return model.field(t_curr, jnp.array([t_val, f_val]), x_val_i, cond_curr)
             
         v_flat = jax.vmap(field_point)(f_flat, t_flat, x_flat)
-        # Reconstrói (F, T, 4) -> Transpose (4, F, T)
         return jnp.transpose(v_flat.reshape(F, T, 4), (2, 0, 1))
 
     def loop_body(i, curr_x):
@@ -124,20 +114,14 @@ def predict_spectrogram(model, mix_spec, key, steps):
 
 def process_file(file_path, model):
     print(f"\n>>> A processar: {file_path}")
-    
     try:
+        # Carrega o audio original sem normalizar ainda
         audio, sr = librosa.load(file_path, sr=CONFIG["TARGET_SR"], mono=False)
     except Exception as e:
         print(f"Erro: {e}")
         return
 
     if audio.ndim == 1: audio = np.stack([audio, audio])
-    
-    # 1. Normalização Peak 0.95 (Crucial)
-    original_peak = np.max(np.abs(audio))
-    if original_peak > 0:
-        audio = audio * (0.95 / original_peak)
-        print(f"Normalização: {original_peak:.4f} -> 0.95")
 
     total_samples = audio.shape[1]
     chunk_samples = int(CONFIG["CHUNK_SIZE"] * sr)
@@ -149,45 +133,49 @@ def process_file(file_path, model):
     
     key = jax.random.PRNGKey(42)
     
-    print("A iniciar inferência...")
-    # Tenta obter o dispositivo CPU explicitamente
+    # Detetar dispositivos
     try:
-        cpu_device = jax.devices("cpu")[0]
-        gpu_device = jax.devices("gpu")[0]
+        cpu_dev = jax.devices("cpu")[0]
+        gpu_dev = jax.devices("gpu")[0]
     except:
-        print("Aviso: Falha ao detetar dispositivos CPU/GPU específicos. A usar padrão.")
-        cpu_device = None
-        gpu_device = None
+        cpu_dev, gpu_dev = None, None
 
+    print("A iniciar inferência com Normalização por Chunk...")
     for i in tqdm(range(0, total_samples - chunk_samples + 1, hop_samples)):
+        # 1. Extrair Chunk
         chunk = audio[:, i : i + chunk_samples]
         
-        # Preparar chunk (1, 2, N)
+        # 2. Normalização Local (CRÍTICO: Igual ao Treino)
+        chunk_peak = np.max(np.abs(chunk))
+        scale_factor = 1.0
+        if chunk_peak > 1e-8:
+            scale_factor = 0.95 / chunk_peak
+            chunk = chunk * scale_factor
+        
+        # Preparar para JAX
         chunk_jax = jnp.array(chunk)[None, ...]
         
-        # 1. STFT (JAX on CPU)
+        # 3. Processamento
+        # STFT no CPU
         spec_jax = cpu_stft_jax(chunk_jax)
+        # Modelo na GPU
+        if gpu_dev: spec_gpu = jax.device_put(spec_jax, gpu_dev)
+        else: spec_gpu = spec_jax
         
-        # Mover para GPU
-        if gpu_device:
-            spec_gpu = jax.device_put(spec_jax, gpu_device)
-        else:
-            spec_gpu = spec_jax # Fallback
-
-        # 2. Inferência (GPU)
         key, subkey = jax.random.split(key)
         rec_spec_gpu = predict_spectrogram(model, spec_gpu, subkey, CONFIG["ODE_STEPS"])
         
-        # 3. ISTFT (JAX on CPU)
-        if cpu_device:
-            rec_spec_cpu = jax.device_put(rec_spec_gpu, cpu_device)
-        else:
-            rec_spec_cpu = rec_spec_gpu # Fallback
-            
+        # ISTFT no CPU
+        if cpu_dev: rec_spec_cpu = jax.device_put(rec_spec_gpu, cpu_dev)
+        else: rec_spec_cpu = rec_spec_gpu
         rec_audio_jax = cpu_istft_jax(rec_spec_cpu)
         
         rec_audio = np.array(rec_audio_jax[0])
         
+        # 4. Desnormalização (Restaurar volume original)
+        rec_audio = rec_audio / scale_factor
+        
+        # Overlap-Add
         valid_len = min(rec_audio.shape[1], chunk_samples)
         output_buffer[:, i : i + valid_len] += rec_audio[:, :valid_len] * window[:valid_len]
         weight_buffer[i : i + valid_len] += window[:valid_len]
