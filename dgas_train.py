@@ -5,6 +5,7 @@ import equinox as eqx
 import time
 import os
 import shutil
+import sys
 from dgas_model import Generator, Discriminator
 from dgas_data import AudioLoader
 
@@ -16,7 +17,6 @@ CONFIG = {
     "STEPS": 1000000,
     "WARMUP_STEPS": 5000, 
     "N_FFT": 2048, "HOP_LENGTH": 512,
-    
     "LAMBDA_FLOW": 10.0,
     "LAMBDA_MRSTFT": 10.0,
     "LAMBDA_ADV": 0.05,   
@@ -24,14 +24,12 @@ CONFIG = {
     "R1_INTERVAL": 16,    
 }
 
-# --- AUX: LOG COORDINATES ---
 def get_log_coords(F, T):
     times = jnp.linspace(0, 1, T)
     linear_freqs = jnp.linspace(0, 1, F)
     log_freqs = jnp.log1p(linear_freqs * 10.0) / jnp.log1p(10.0)
     return log_freqs, times
 
-# --- STFT LOSSES ---
 def complex_mag(spec):
     l_re, l_im = spec[:, 0], spec[:, 1]
     r_re, r_im = spec[:, 2], spec[:, 3]
@@ -40,31 +38,27 @@ def complex_mag(spec):
     return jnp.stack([mag_l, mag_r], axis=1)
 
 def stft_loss_fn(mag_pred, mag_target):
+    # Loss relativa (Scale Invariant) - por isso o MRS não muda com o boost
     sc_loss = jnp.mean(jnp.abs(mag_pred - mag_target)) / (jnp.mean(jnp.abs(mag_target)) + 1e-6)
     log_loss = jnp.mean(jnp.abs(jnp.log1p(mag_pred) - jnp.log1p(mag_target)))
     return sc_loss + log_loss
 
 def safe_avg_pool(x, window_shape, strides):
-    B, C, F, T = x.shape
     val = jax.lax.reduce_window(x, 0.0, jax.lax.add, window_shape, strides, 'SAME')
-    ones_spatial = jnp.ones((1, 1, F, T))
+    ones_spatial = jnp.ones((1, 1, x.shape[2], x.shape[3]))
     count = jax.lax.reduce_window(ones_spatial, 0.0, jax.lax.add, window_shape, strides, 'SAME')
     return val / (count + 1e-6)
 
 def compute_mrstft_loss(pred_complex, target_complex):
     m_pred = complex_mag(pred_complex)
     m_target = complex_mag(target_complex)
-    
     loss_1 = stft_loss_fn(m_pred, m_target)
-    
     p_t = safe_avg_pool(m_pred, (1, 1, 1, 4), (1, 1, 1, 2))
     t_t = safe_avg_pool(m_target, (1, 1, 1, 4), (1, 1, 1, 2))
     loss_2 = stft_loss_fn(p_t, t_t)
-    
     p_f = safe_avg_pool(m_pred, (1, 1, 4, 1), (1, 1, 2, 1))
     t_f = safe_avg_pool(m_target, (1, 1, 4, 1), (1, 1, 2, 1))
     loss_3 = stft_loss_fn(p_f, t_f)
-    
     return loss_1 + loss_2 + loss_3
 
 def gpu_stft(audio):
@@ -74,9 +68,11 @@ def gpu_stft(audio):
     spec = jnp.stack([Zxx.real, Zxx.imag], axis=-1)
     B, C, F, T, _ = spec.shape
     spec = jnp.transpose(spec, (0, 1, 4, 2, 3)).reshape(B, C * 2, F, T)
-    return spec
+    
+    # --- HARDCODED BOOST ---
+    # Multiplicação forçada por 50.0
+    return spec * 50.0
 
-# --- AUGMENTATION ---
 def diff_spec_augment(x, key, strength):
     B, C, F, T = x.shape
     k1, k2, k3 = jax.random.split(key, 3)
@@ -87,36 +83,27 @@ def diff_spec_augment(x, key, strength):
     f_mask = jnp.where((freq_grid >= f_pos) & (freq_grid < (f_pos + f_width * strength)), 0.0, 1.0)
     return jnp.where(do_aug, x * f_mask, x)
 
-# --- LOSSES ---
 def compute_disc_loss(discriminator, generator, mix_spec, target_spec, key, do_r1, aug_strength):
     z = jax.vmap(generator.encoder)(mix_spec)
     B, _, F, T = target_spec.shape
-    
     t = jax.random.uniform(key, (B,), minval=0.0, maxval=1.0)
     key, k_noise, k_aug = jax.random.split(key, 3)
     x0 = jax.random.normal(k_noise, target_spec.shape)
     t_b = t[:, None, None, None]
     x_t = t_b * target_spec + (1.0 - t_b) * x0
-    
     freqs, times = get_log_coords(F, T)
     grid_f, grid_t = jnp.meshgrid(freqs, times, indexing='ij')
     ff, tt = grid_f.flatten(), grid_t.flatten()
-    
     def predict_batch_sample(ti, xti, zi):
         xti_flat = xti.reshape(4, -1).T
         v = jax.vmap(lambda f, t_val, x_val: generator.field(ti, jnp.array([t_val, f]), x_val, zi))(ff, tt, xti_flat)
         return v.T.reshape(4, F, T)
-
     v_pred = jax.vmap(predict_batch_sample)(t, x_t, z)
-    
     target_aug = diff_spec_augment(target_spec, k_aug, aug_strength)
     fake_aug = diff_spec_augment(v_pred, k_aug, aug_strength)
-    
     real_scores = jax.vmap(discriminator)(target_aug, mix_spec)
     fake_scores = jax.vmap(discriminator)(fake_aug, mix_spec)
-    
     d_loss = jnp.mean(jax.nn.relu(1.0 - real_scores)) + jnp.mean(jax.nn.relu(1.0 + fake_scores))
-    
     def compute_r1():
         grads = jax.vmap(jax.grad(lambda x, c: jnp.squeeze(discriminator(x, c))), in_axes=(0, 0))(target_spec, mix_spec)
         return jnp.mean(jnp.sum(grads.reshape(B, -1)**2, axis=1)) * CONFIG["LAMBDA_R1"] * 0.5
@@ -132,98 +119,77 @@ def compute_gen_loss(generator, discriminator, mix_spec, target_spec, key, step,
     t_b = t[:, None, None, None]
     x_t = t_b * target_spec + (1.0 - t_b) * x0
     v_target = target_spec - x0
-    
     freqs, times = get_log_coords(F, T)
     grid_f, grid_t = jnp.meshgrid(freqs, times, indexing='ij')
     ff, tt = grid_f.flatten(), grid_t.flatten()
-    
     def predict_batch_sample(ti, xti, zi):
         xti_flat = xti.reshape(4, -1).T
         v = jax.vmap(lambda f, t_val, x_val: generator.field(ti, jnp.array([t_val, f]), x_val, zi))(ff, tt, xti_flat)
         return v.T.reshape(4, F, T)
-
     v_pred = jax.vmap(predict_batch_sample)(t, x_t, z)
-    
     flow_loss = jnp.mean((v_pred - v_target)**2)
     mrstft_loss = compute_mrstft_loss(v_pred, v_target)
-    
     dot = jnp.sum(v_pred * v_target, axis=1)
     norm_p = jnp.linalg.norm(v_pred, axis=1) + 1e-6
     norm_t = jnp.linalg.norm(v_target, axis=1) + 1e-6
     raw_phase_loss = jnp.mean(1.0 - (dot / (norm_p * norm_t)))
-    
     phase_weight = jnp.clip(step / 10000.0, 0.0, 1.0) * 1.0 
-    
     fake_aug = diff_spec_augment(v_pred, k_aug, aug_strength)
     fake_score = jax.vmap(discriminator)(fake_aug, mix_spec)
     adv_loss = -jnp.mean(fake_score)
     adv_weight = jax.lax.cond(step < CONFIG["WARMUP_STEPS"], lambda: 0.0, lambda: CONFIG["LAMBDA_ADV"])
-    
-    total = (CONFIG["LAMBDA_FLOW"] * flow_loss + 
-             CONFIG["LAMBDA_MRSTFT"] * mrstft_loss + 
-             phase_weight * raw_phase_loss +
-             adv_weight * adv_loss)
-             
+    total = (CONFIG["LAMBDA_FLOW"] * flow_loss + CONFIG["LAMBDA_MRSTFT"] * mrstft_loss + phase_weight * raw_phase_loss + adv_weight * adv_loss)
     return total, (flow_loss, mrstft_loss, raw_phase_loss, adv_loss)
 
 @eqx.filter_jit
 def train_step(gen, disc, opt_gen, opt_disc, optim_gen, optim_disc, mix_wav, target_wav, key, step, pid_state):
     mix_spec = gpu_stft(mix_wav)
     target_spec = gpu_stft(target_wav)
+    
+    # --- ESPIÃO DE DEPURÇÃO ---
+    # Isto vai imprimir no terminal o valor MAXIMO do target.
+    # Se estiver a funcionar, deve imprimir algo como 5.0, 10.0 ou 15.0.
+    # Se imprimir 0.2, sabemos que o boost falhou.
+    jax.debug.print("DEBUG: Target Max = {}", jnp.max(jnp.abs(target_spec)))
+    
     k1, k2, k_aug = jax.random.split(key, 3)
     do_r1 = (step % CONFIG["R1_INTERVAL"] == 0)
     pid_int, aug_strength = pid_state
-    
     def update_disc(d, g, o_state):
         (loss, (clean_d_loss, r1)), grads = eqx.filter_value_and_grad(compute_disc_loss, has_aux=True)(d, g, mix_spec, target_spec, k1, do_r1, aug_strength)
         updates, new_state = optim_disc.update(grads, o_state, d)
         new_d = eqx.apply_updates(d, updates)
         return new_d, new_state, clean_d_loss, r1
-
     (g_loss, gen_metrics), grads_g = eqx.filter_value_and_grad(compute_gen_loss, has_aux=True)(gen, disc, mix_spec, target_spec, k2, step, aug_strength)
     updates_g, new_opt_gen = optim_gen.update(grads_g, opt_gen, gen)
     new_gen = eqx.apply_updates(gen, updates_g)
-    
     new_disc, new_opt_disc, d_loss, r1_val = jax.lax.cond(
         step >= CONFIG["WARMUP_STEPS"],
         lambda: update_disc(disc, gen, opt_disc),
         lambda: (disc, opt_disc, 1.0, 0.0)
     )
-    
     target_d_loss = 0.4 
     error = target_d_loss - d_loss
     new_int = jnp.clip(pid_int + error * 0.05, -2.0, 5.0)
     new_aug = jnp.clip((new_int * 0.2) + (error * 0.2), 0.0, 0.8)
     new_aug = jax.lax.cond(step < CONFIG["WARMUP_STEPS"], lambda: 0.0, lambda: new_aug)
-    
     return new_gen, new_disc, new_opt_gen, new_opt_disc, g_loss, d_loss, r1_val, gen_metrics, (new_int, new_aug)
 
-# --- MAIN CORRIGIDO ---
 def main():
-    print(f"=== DGAS 3.6.4: RESTART & STABILIZE (AdamW + Weight Monitor) ===")
+    print(f"=== DGAS 3.6.7: HARDCODED BOOST & DEBUG ===")
     
-    # 1. Limpeza de checkpoints antigos (Crucial para não carregar pesos corrompidos)
     if os.path.exists(CONFIG['CHECKPOINT_DIR']): 
         shutil.rmtree(CONFIG['CHECKPOINT_DIR'])
-        print("🗑️  Checkpoints antigos removidos (Restart limpo).")
+        print("🗑️  Checkpoints antigos removidos.")
     os.makedirs(CONFIG['CHECKPOINT_DIR'], exist_ok=True)
     
     key = jax.random.PRNGKey(42)
     k_gen, k_disc, k_loop = jax.random.split(key, 3)
-    
-    # Inicialização dos Modelos
     gen = Generator(key=k_gen)
     disc = Discriminator(key=k_disc)
     
-    # 2. OPTIMIZER CORRIGIDO: AdamW com Weight Decay
-    # O Weight Decay (1e-4) impede que os pesos explodam para valores como 11.0 ou 19.0
     lr = optax.warmup_cosine_decay_schedule(1e-5, 3e-4, 2000, CONFIG["STEPS"], 1e-6)
-    
-    # Alteração: Mudança de optax.adam para optax.adamw
-    optim = optax.chain(
-        optax.clip_by_global_norm(1.0), 
-        optax.adamw(lr, b1=0.5, b2=0.9, weight_decay=1e-4)
-    )
+    optim = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(lr, b1=0.5, b2=0.9, weight_decay=1e-4))
     
     opt_gen_state = optim.init(eqx.filter(gen, eqx.is_array))
     opt_disc_state = optim.init(eqx.filter(disc, eqx.is_array))
@@ -232,46 +198,24 @@ def main():
     loader = AudioLoader(CONFIG["DATA_DIR"], CONFIG["BATCH_SIZE"])
     loader.start()
     step = 0
-    
     try:
         while step < CONFIG["STEPS"]:
             mix, tgt = loader.get_batch()
             mix, tgt = jnp.array(mix), jnp.array(tgt)
             k_loop, subkey = jax.random.split(k_loop)
-            
             start = time.time()
             gen, disc, opt_gen_state, opt_disc_state, g_loss, d_loss, r1, (flow, mrs, phase, adv), pid_state = train_step(
                 gen, disc, opt_gen_state, opt_disc_state, optim, optim,
                 mix, tgt, subkey, jnp.array(step), pid_state
             )
-            # Força o JAX a calcular para medir o tempo real
             jax.block_until_ready(g_loss)
             dt = time.time() - start
             step += 1
-            
-            # --- MONITORIZAÇÃO ---
             if step % 10 == 0:
-                print(f"S{step:05d} | G:{g_loss:.2f} D:{d_loss:.2f} | FL:{flow:.2f} MRS:{mrs:.2f} PH:{phase:.3f} | ADA:{pid_state[1]:.2f} | {dt*1000:.0f}ms")
-            
-            # --- HEALTH CHECK (Verificar se pesos estão a explodir) ---
-            if step % 100 == 0:
-                # Calcula a média absoluta dos pesos
-                params = eqx.filter(gen, eqx.is_array)
-                leaves = jax.tree_util.tree_leaves(params)
-                # Média das médias das folhas (rápido de calcular)
-                mean_w = jnp.mean(jnp.stack([jnp.mean(jnp.abs(x)) for x in leaves]))
-                
-                # Se os pesos passarem de 1.0 (geralmente devem estar < 0.1), algo está mal
-                if mean_w > 1.0:
-                    print(f"⚠️  PERIGO: Pesos a crescer demasiado (Mean: {mean_w:.2f}). O modelo pode estar a divergir!")
-                elif step % 1000 == 0:
-                    print(f"🩺 Health Check: Pesos estáveis (Mean: {mean_w:.4f})")
-
-            # --- SAVE ---
+                print(f"S{step:05d} | G:{g_loss:.2f} D:{d_loss:.2f} | FL:{flow:.2f} MRS:{mrs:.2f} | {dt*1000:.0f}ms")
             if step % CONFIG["SAVE_INTERVAL"] == 0:
                 eqx.tree_serialise_leaves(os.path.join(CONFIG["CHECKPOINT_DIR"], "dgas_latest.eqx"), (gen, disc))
                 print(f"💾 Checkpoint: {step}")
-                
     except KeyboardInterrupt: pass
     finally: loader.stop()
 
