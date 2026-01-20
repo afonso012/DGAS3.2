@@ -14,7 +14,7 @@ CONFIG = {
     "HOP_LENGTH": 512,
     "CHUNK_SIZE": 5.0,
     "OVERLAP": 0.5,
-    "ODE_STEPS": 16,
+    "ODE_STEPS": 32, # Heun precisa de mais steps para brilhar
     "TARGET_SR": 44100
 }
 
@@ -23,7 +23,6 @@ def load_models():
     key = jax.random.PRNGKey(0)
     k1, k2 = jax.random.split(key)
     
-    # Inicializar estrutura IDÊNTICA ao treino
     gen = Generator(key=k1)
     disc = Discriminator(key=k2)
     models = (gen, disc)
@@ -32,34 +31,55 @@ def load_models():
         models = eqx.tree_deserialise_leaves(CONFIG['CHECKPOINT'], models)
         print(">>> Pesos carregados com SUCESSO.")
         gen = models[0]
-        # Retorna o modelo (vector field) e o encoder separadamente para facilitar uso
         return gen.field, gen.encoder
     except FileNotFoundError:
         raise FileNotFoundError(f"Erro: Checkpoint não encontrado!")
 
 @eqx.filter_jit
 def predict_step(model, encoder, mix_spec, key, steps):
+    # mix_spec: (1, 4, F, T)
     cond = encoder(mix_spec)
     x = jax.random.normal(key, mix_spec.shape)
     dt = 1.0 / steps
     
-    # Grid espacial para o HashGrid
     B, C, F, T = mix_spec.shape
     freqs = jnp.linspace(0, 1, F)
     times = jnp.linspace(0, 1, T)
     grid_f, grid_t = jnp.meshgrid(freqs, times, indexing='ij')
     
+    # Flatten grids
+    f_flat, t_flat = grid_f.flatten(), grid_t.flatten()
+    
+    # Função auxiliar para calcular o campo vetorial
+    def get_velocity(t_curr, x_curr):
+        # x_curr: (1, 4, F, T) -> Precisa ser transformado para (F*T, 4) para o vmap
+        # Flatten espacialmente preservando canais no último eixo
+        x_flat = jnp.transpose(x_curr, (0, 2, 3, 1)).reshape(-1, 4) # (F*T, 4)
+        
+        # O vmap agora itera sobre (f, t, x_val)
+        def field_point(f_val, t_val, x_val_i):
+            # Passamos x_val_i (4,) para o modelo junto com t e pos
+            return model(t_curr, jnp.array([t_val, f_val]), x_val_i, cond[0])
+            
+        # Vmap sobre todos os pixels do espectrograma
+        v_flat = jax.vmap(field_point)(f_flat, t_flat, x_flat)
+        
+        # Reshape de volta para (1, 4, F, T)
+        return jnp.transpose(v_flat.reshape(1, F, T, 4), (0, 3, 1, 2))
+
     def loop_body(i, curr_x):
         t = i / steps
         
-        def predict_single(xt_i, z_i):
-            f_flat, t_flat = grid_f.flatten(), grid_t.flatten()
-            def field_point(f_val, t_val):
-                return model(t, jnp.array([t_val, f_val]), z_i)
-            return jax.vmap(field_point)(f_flat, t_flat).T.reshape(4, F, T)
-            
-        v = jax.vmap(predict_single)(curr_x, cond)
-        return curr_x + v * dt
+        # === Solver HEUN (2nd Order) ===
+        # 1. Predict (Euler)
+        d1 = get_velocity(t, curr_x)
+        x_tilde = curr_x + d1 * dt
+        
+        # 2. Correct (Trapezoidal Rule)
+        d2 = get_velocity(t + dt, x_tilde)
+        curr_x = curr_x + (d1 + d2) * 0.5 * dt
+        
+        return curr_x
 
     return jax.lax.fori_loop(0, steps, loop_body, x)
 
@@ -93,12 +113,11 @@ def process_file(file_path, model, encoder):
         r_stft = librosa.stft(chunk[1], n_fft=CONFIG["N_FFT"], hop_length=CONFIG["HOP_LENGTH"])
         
         spec_input = np.stack([l_stft.real, l_stft.imag, r_stft.real, r_stft.imag])
-        # Add Batch Dim
         spec_input_jax = jnp.array(spec_input)[None, ...] 
         
         key, subkey = jax.random.split(key)
         predicted_spec = predict_step(model, encoder, spec_input_jax, subkey, CONFIG["ODE_STEPS"])
-        predicted_spec = np.array(predicted_spec[0]) # Remove Batch Dim
+        predicted_spec = np.array(predicted_spec[0]) 
         
         rec_audio = spectrogram_to_audio(predicted_spec)
         valid_len = min(rec_audio.shape[1], chunk_samples)
@@ -109,10 +128,10 @@ def process_file(file_path, model, encoder):
     weight_buffer[weight_buffer < 1e-8] = 1.0
     output_buffer /= weight_buffer
     
-    out_name = file_path.rsplit('.', 1)[0] + "_DGAS_VOCALS.wav"
+    out_name = file_path.rsplit('.', 1)[0] + "_DGAS_FIXED.wav"
     sf.write(out_name, output_buffer.T, sr)
-    print(f"✅ Salvo: {out_name}")
+    print(f"✅ Salvo (Fixed): {out_name}")
 
 if __name__ == "__main__":
     model, encoder = load_models()
-    # Podes adicionar input loop aqui tal como antes
+    # Adicionar loop de input aqui se desejado
