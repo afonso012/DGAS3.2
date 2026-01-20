@@ -4,6 +4,7 @@ import equinox as eqx
 import numpy as np
 import librosa
 import soundfile as sf
+import scipy.signal
 import os
 from tqdm import tqdm
 from dgas_model import Generator, Discriminator
@@ -12,7 +13,7 @@ CONFIG = {
     "CHECKPOINT": "checkpoints/dgas_test.eqx", 
     "N_FFT": 2048,
     "HOP_LENGTH": 512,
-    "CHUNK_SIZE": 5.0,
+    "CHUNK_SIZE": 1.5,
     "OVERLAP": 0.5,
     "ODE_STEPS": 32, 
     "TARGET_SR": 44100
@@ -28,32 +29,40 @@ def load_models():
         models = eqx.tree_deserialise_leaves(CONFIG['CHECKPOINT'], models)
         return models[0]
     except FileNotFoundError:
-        raise FileNotFoundError(f"Erro: Checkpoint não encontrado!")
+        raise FileNotFoundError(f"Erro: Checkpoint não encontrado em {CONFIG['CHECKPOINT']}")
 
-# --- JAX SIGNAL PROCESSING (GPU) ---
-def gpu_stft_inference(audio):
-    # Shape Input: (B=1, Channels, Samples)
-    window = jnp.hanning(CONFIG["N_FFT"])
-    f, t, Zxx = jax.scipy.signal.stft(audio, fs=44100, window=window, nperseg=CONFIG["N_FFT"], noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"])
-    Zxx = jnp.transpose(Zxx, (0, 1, 2, 3))
-    # Output: (B, C, F, T, 2) -> (B, 2*C, F, T)
-    spec = jnp.stack([Zxx.real, Zxx.imag], axis=-1)
-    B, C, F, T, _ = spec.shape
-    return jnp.transpose(spec, (0, 1, 4, 2, 3)).reshape(B, C * 2, F, T)
+# --- CPU SIGNAL PROCESSING (Scipy) ---
+# Movemos isto para CPU para evitar o crash do cuFFT na A100
+def cpu_stft(audio):
+    # audio shape: (2, N)
+    f, t, Zxx = scipy.signal.stft(
+        audio, 
+        fs=CONFIG["TARGET_SR"], 
+        window='hann', 
+        nperseg=CONFIG["N_FFT"], 
+        noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"],
+        boundary='zeros',
+        padded=True
+    )
+    # Zxx shape: (2, F, T) -> complexo
+    # Converter para formato do modelo: (1, 4, F, T) -> [L_real, L_imag, R_real, R_imag]
+    spec_l = Zxx[0]
+    spec_r = Zxx[1]
+    spec = np.stack([spec_l.real, spec_l.imag, spec_r.real, spec_r.imag], axis=0)
+    return spec[None, ...] # Adicionar Batch dim: (1, 4, F, T)
 
-def gpu_istft_inference(spec):
-    # Input: (B, 4, F, T) -> De volta para audio
+def cpu_istft(spec_jax):
+    # spec_jax: (1, 4, F, T) -> vindo da GPU
+    spec = np.array(spec_jax[0]) # Converter para Numpy CPU
+    
     # Reconstruir complexos
-    # L: canais 0 (real), 1 (imag) | R: canais 2 (real), 3 (imag)
-    l_complex = spec[:, 0] + 1j * spec[:, 1]
-    r_complex = spec[:, 2] + 1j * spec[:, 3]
+    l_complex = spec[0] + 1j * spec[1]
+    r_complex = spec[2] + 1j * spec[3]
     
-    window = jnp.hanning(CONFIG["N_FFT"])
-    # jax.scipy.signal.istft existe nas versões recentes
-    _, audio_l = jax.scipy.signal.istft(l_complex, fs=44100, window=window, nperseg=CONFIG["N_FFT"], noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"])
-    _, audio_r = jax.scipy.signal.istft(r_complex, fs=44100, window=window, nperseg=CONFIG["N_FFT"], noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"])
+    _, audio_l = scipy.signal.istft(l_complex, fs=CONFIG["TARGET_SR"], window='hann', nperseg=CONFIG["N_FFT"], noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"])
+    _, audio_r = scipy.signal.istft(r_complex, fs=CONFIG["TARGET_SR"], window='hann', nperseg=CONFIG["N_FFT"], noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"])
     
-    return jnp.stack([audio_l, audio_r], axis=1)
+    return np.stack([audio_l, audio_r], axis=0)
 
 def get_log_coords(F, T):
     times = jnp.linspace(0, 1, T)
@@ -61,11 +70,10 @@ def get_log_coords(F, T):
     log_freqs = jnp.log1p(linear_freqs * 10.0) / jnp.log1p(10.0)
     return log_freqs, times
 
+# --- GPU MODEL INFERENCE (Apenas Neural Net) ---
 @eqx.filter_jit
-def predict_chunk(model, audio_chunk, key, steps):
-    # 1. GPU STFT
-    mix_spec = gpu_stft_inference(audio_chunk) # (1, 4, F, T)
-    
+def predict_spectrogram(model, mix_spec, key, steps):
+    # mix_spec já entra como (1, 4, F, T)
     cond = jax.vmap(model.encoder)(mix_spec) 
     x = jax.random.normal(key, mix_spec.shape)
     dt = 1.0 / steps
@@ -91,40 +99,60 @@ def predict_chunk(model, audio_chunk, key, steps):
         return curr_x
 
     final_spec = jax.lax.fori_loop(0, steps, loop_body, x)
-    
-    # 2. GPU ISTFT
-    return gpu_istft_inference(final_spec)
+    return final_spec
 
 def process_file(file_path, model):
     print(f"\n>>> A processar: {file_path}")
-    audio, sr = librosa.load(file_path, sr=CONFIG["TARGET_SR"], mono=False)
-    if audio.ndim == 1: audio = np.stack([audio, audio])
     
+    # 1. Carregar Audio
+    try:
+        audio, sr = librosa.load(file_path, sr=CONFIG["TARGET_SR"], mono=False)
+    except Exception as e:
+        print(f"Erro ao abrir ficheiro: {e}")
+        return
+
+    if audio.ndim == 1:
+        print("Aviso: Audio Mono detetado. A converter para Stereo...")
+        audio = np.stack([audio, audio])
+    
+    # 2. Normalização de Pico (ESSENCIAL)
+    original_peak = np.max(np.abs(audio))
+    if original_peak > 0:
+        scale_factor = 0.95 / original_peak
+        audio = audio * scale_factor
+        print(f"Normalização aplicada: Peak {original_peak:.4f} -> 0.95")
+    else:
+        print("Aviso: Audio silencioso detetado.")
+
     total_samples = audio.shape[1]
     chunk_samples = int(CONFIG["CHUNK_SIZE"] * sr)
     hop_samples = int(chunk_samples * (1 - CONFIG["OVERLAP"]))
     
-    # Prepara buffers
     output_buffer = np.zeros_like(audio)
     weight_buffer = np.zeros(total_samples)
     window = np.hanning(chunk_samples)
     
     key = jax.random.PRNGKey(42)
     
+    print("A iniciar inferência (STFT CPU -> GPU Model -> ISTFT CPU)...")
     for i in tqdm(range(0, total_samples - chunk_samples + 1, hop_samples)):
         chunk = audio[:, i : i + chunk_samples]
         
-        # Envia para GPU como JAX Array (B=1, C, Samples)
-        chunk_jax = jnp.array(chunk)[None, ...]
+        # 1. CPU STFT
+        spec_cpu = cpu_stft(chunk) # Retorna numpy array
         
+        # 2. Envia para GPU
+        spec_jax = jnp.array(spec_cpu)
+        
+        # 3. Inferência Neural (Flow Matching)
         key, subkey = jax.random.split(key)
+        rec_spec_jax = predict_spectrogram(model, spec_jax, subkey, CONFIG["ODE_STEPS"])
         
-        # O modelo faz STFT -> Flow -> ISTFT tudo na GPU
-        rec_audio_jax = predict_chunk(model, chunk_jax, subkey, CONFIG["ODE_STEPS"])
+        # 4. CPU ISTFT
+        rec_audio = cpu_istft(rec_spec_jax)
         
-        # Traz de volta para CPU só o áudio final
-        rec_audio = np.array(rec_audio_jax[0])
-        
+        # Overlap-Add
+        # Verifica tamanhos (pode haver pequenas diferenças de rounding no ISTFT)
         valid_len = min(rec_audio.shape[1], chunk_samples)
         output_buffer[:, i : i + valid_len] += rec_audio[:, :valid_len] * window[:valid_len]
         weight_buffer[i : i + valid_len] += window[:valid_len]
@@ -132,9 +160,9 @@ def process_file(file_path, model):
     weight_buffer[weight_buffer < 1e-8] = 1.0
     output_buffer /= weight_buffer
     
-    out_name = file_path.rsplit('.', 1)[0] + "_DGAS_A100.wav"
+    out_name = file_path.rsplit('.', 1)[0] + "_DGAS_OUT.wav"
     sf.write(out_name, output_buffer.T, sr)
-    print(f"✅ Salvo: {out_name}")
+    print(f"✅ Sucesso! Salvo em: {out_name}")
 
 if __name__ == "__main__":
     generator = load_models()
