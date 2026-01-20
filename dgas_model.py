@@ -28,7 +28,8 @@ class ContinuousHashGrid(eqx.Module):
     resolution: int
     grid_size: int
 
-    def __init__(self, key, resolution=128, grid_size=4096, output_dim=16):
+    # SOTA: Hash Grid expandido para 16k (16384) para reduzir colisões
+    def __init__(self, key, resolution=128, grid_size=16384, output_dim=16):
         self.resolution = resolution
         self.grid_size = grid_size
         limit = jnp.sqrt(6 / output_dim)
@@ -67,19 +68,27 @@ class DGASField(eqx.Module):
     time_embed: SinusoidalTimeEmbedding
     layers: List[FiLMLayer]
     to_film: eqx.nn.Linear
+    val_proj: eqx.nn.Linear # Nova projeção para x_val
     final: eqx.nn.Linear
     hidden_dim: int
     
     def __init__(self, key, hidden_dim=256, latent_dim=128):
         keys = jax.random.split(key, 12)
         self.hidden_dim = hidden_dim
+        # Grids com resoluções progressivas
         self.grids = [
             ContinuousHashGrid(keys[0], resolution=16),
             ContinuousHashGrid(keys[1], resolution=64),
             ContinuousHashGrid(keys[2], resolution=256)
         ]
         self.time_embed = SinusoidalTimeEmbedding(32)
-        in_dim = 16 * 3 + 2 + 32
+        
+        # SOTA: Projeção do valor do sinal ruidoso (4 canais: Re/Im L/R)
+        self.val_proj = eqx.nn.Linear(4, 32, key=keys[10])
+
+        # Dimensão de entrada ajustada: Grids + Coords(2) + Time(32) + Signal_Value(32)
+        in_dim = 16 * 3 + 2 + 32 + 32
+        
         self.layers = [
             FiLMLayer(keys[3], in_dim, hidden_dim),
             FiLMLayer(keys[4], hidden_dim, hidden_dim),
@@ -90,10 +99,17 @@ class DGASField(eqx.Module):
         self.final = eqx.nn.Linear(hidden_dim, 4, key=keys[8])
         self.final = eqx.tree_at(lambda l: l.weight, self.final, self.final.weight * 0.01)
 
-    def __call__(self, t, x_pos, cond):
+    # SOTA: Re-acoplamento de x_t (x_val)
+    # O campo vetorial agora depende do valor atual da partícula, não apenas da posição
+    def __call__(self, t, x_pos, x_val, cond):
         t_emb = self.time_embed(t)
+        val_emb = self.val_proj(x_val) # Incorporar o sinal ruidoso
+        
         grid_feats = [g(x_pos) for g in self.grids]
-        h = jnp.concatenate(grid_feats + [x_pos, t_emb], axis=0)
+        
+        # Concatenar tudo: Features Espaciais + Posição + Tempo + Valor do Sinal
+        h = jnp.concatenate(grid_feats + [x_pos, t_emb, val_emb], axis=0)
+        
         film_params = self.to_film(cond).reshape(4, 2, self.hidden_dim)
         for i, layer in enumerate(self.layers):
             gamma, beta = film_params[i]
@@ -143,6 +159,7 @@ class Generator(eqx.Module):
         k1, k2 = jax.random.split(key)
         self.encoder = LatentEncoder(k1)
         self.field = DGASField(k2)
-    def __call__(self, t, x_pos, mix_spec):
+    # Atualizado para passar x_val (mix_spec ou noisy spec) para o field
+    def __call__(self, t, x_pos, x_val, mix_spec):
         z = self.encoder(mix_spec)
-        return self.field(t, x_pos, z)
+        return self.field(t, x_pos, x_val, z)

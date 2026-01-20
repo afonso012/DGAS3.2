@@ -4,13 +4,13 @@ import threading
 import queue
 import random
 import os
-import pyloudnorm as pyln # AGORA A SER USADO!
+# pyloudnorm removido em favor de Peak Normalization (SOTA para estabilidade)
 
 SAMPLE_RATE = 44100
 CHUNK_DURATION = 1.5  
 CHUNK_SAMPLES = int(CHUNK_DURATION * SAMPLE_RATE)
 NUM_WORKERS = 8 
-TARGET_LUFS = -24.0
+# TARGET_LUFS removido
 
 class AudioLoader:
     def __init__(self, data_dir: str, batch_size: int = 16):
@@ -19,8 +19,6 @@ class AudioLoader:
         self.track_folders = self._scan_musdb(data_dir)
         self.queue = queue.Queue(maxsize=40)
         self.running = False
-        # Meter para calcular loudness
-        self.meter = pyln.Meter(SAMPLE_RATE)
         print(f"Dataset: {len(self.track_folders)} faixas.")
 
     def _scan_musdb(self, directory: str):
@@ -31,16 +29,16 @@ class AudioLoader:
                 valid.append(root)
         return valid
 
-    def _normalize(self, audio):
-        # Medir Loudness e normalizar
-        try:
-            # Pyloudnorm espera (Samples, Channels)
-            loudness = self.meter.integrated_loudness(audio)
-            # Proteção contra silêncio infinito
-            if loudness == -float('inf'): return audio
-            return pyln.normalize.loudness(audio, loudness, TARGET_LUFS)
-        except:
-            return audio # Fallback
+    def _normalize_peak(self, mix, vox):
+        # SOTA: Peak Normalization
+        # Garante range [-1, 1] perfeito, evitando gradientes vanishing/exploding de LUFS
+        max_val = np.max(np.abs(mix))
+        if max_val < 1e-8:
+            return mix, vox # Silêncio
+        
+        # Normaliza a mistura para 0.95 (margem de segurança)
+        scale = 0.95 / max_val
+        return mix * scale, vox * scale
 
     def _load_chunk_pair(self, folder_path):
         try:
@@ -68,17 +66,8 @@ class AudioLoader:
             elif mix.shape[1] > 2:
                 mix, vox = mix[:, :2], vox[:, :2]
             
-            # --- NORMALIZAÇÃO CRÍTICA ---
-            # Normalizar Mixture (Input) para -24 LUFS
-            # Aplicar mesmo ganho ao Vocal (Target) para manter a relação relativa
-            try:
-                mix_loudness = self.meter.integrated_loudness(mix)
-                if mix_loudness > -70: # Só normalizar se houver sinal
-                    delta = TARGET_LUFS - mix_loudness
-                    gain = 10.0 ** (delta / 20.0)
-                    mix = mix * gain
-                    vox = vox * gain
-            except: pass # Se falhar, usa original
+            # --- NORMALIZAÇÃO POR PICO ---
+            mix, vox = self._normalize_peak(mix, vox)
                 
             return mix, vox
         except:
