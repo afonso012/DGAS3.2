@@ -37,8 +37,10 @@ def load_models():
 
 @eqx.filter_jit
 def predict_step(model, encoder, mix_spec, key, steps):
-    # mix_spec: (1, 4, F, T)
-    cond = encoder(mix_spec)
+    # CORREÇÃO: Usar vmap para lidar com a dimensão de Batch (1, 4, F, T)
+    # Isto retorna 'cond' com shape (1, 128)
+    cond = jax.vmap(encoder)(mix_spec)
+    
     x = jax.random.normal(key, mix_spec.shape)
     dt = 1.0 / steps
     
@@ -47,38 +49,25 @@ def predict_step(model, encoder, mix_spec, key, steps):
     times = jnp.linspace(0, 1, T)
     grid_f, grid_t = jnp.meshgrid(freqs, times, indexing='ij')
     
-    # Flatten grids
     f_flat, t_flat = grid_f.flatten(), grid_t.flatten()
     
-    # Função auxiliar para calcular o campo vetorial
     def get_velocity(t_curr, x_curr):
-        # x_curr: (1, 4, F, T) -> Precisa ser transformado para (F*T, 4) para o vmap
-        # Flatten espacialmente preservando canais no último eixo
-        x_flat = jnp.transpose(x_curr, (0, 2, 3, 1)).reshape(-1, 4) # (F*T, 4)
+        x_flat = jnp.transpose(x_curr, (0, 2, 3, 1)).reshape(-1, 4)
         
-        # O vmap agora itera sobre (f, t, x_val)
         def field_point(f_val, t_val, x_val_i):
-            # Passamos x_val_i (4,) para o modelo junto com t e pos
+            # CORREÇÃO: Aceder a cond[0] porque cond agora tem shape (1, 128)
             return model(t_curr, jnp.array([t_val, f_val]), x_val_i, cond[0])
             
-        # Vmap sobre todos os pixels do espectrograma
         v_flat = jax.vmap(field_point)(f_flat, t_flat, x_flat)
-        
-        # Reshape de volta para (1, 4, F, T)
         return jnp.transpose(v_flat.reshape(1, F, T, 4), (0, 3, 1, 2))
 
     def loop_body(i, curr_x):
         t = i / steps
-        
-        # === Solver HEUN (2nd Order) ===
-        # 1. Predict (Euler)
+        # Solver HEUN (2nd Order)
         d1 = get_velocity(t, curr_x)
         x_tilde = curr_x + d1 * dt
-        
-        # 2. Correct (Trapezoidal Rule)
         d2 = get_velocity(t + dt, x_tilde)
         curr_x = curr_x + (d1 + d2) * 0.5 * dt
-        
         return curr_x
 
     return jax.lax.fori_loop(0, steps, loop_body, x)
