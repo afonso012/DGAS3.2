@@ -115,13 +115,24 @@ def predict_spectrogram(model, mix_spec, key, steps):
 def process_file(file_path, model):
     print(f"\n>>> A processar: {file_path}")
     try:
-        # Carrega o audio original sem normalizar ainda
+        # 1. Carregar o áudio TODO de uma vez
         audio, sr = librosa.load(file_path, sr=CONFIG["TARGET_SR"], mono=False)
     except Exception as e:
-        print(f"Erro: {e}")
+        print(f"Erro ao carregar: {e}")
         return
 
     if audio.ndim == 1: audio = np.stack([audio, audio])
+
+    # 2. Normalização GLOBAL (A Correção Crítica)
+    # Calcula o pico da música inteira, não de cada pedaço
+    global_peak = np.max(np.abs(audio))
+    if global_peak < 1e-8:
+        print("Aviso: Áudio vazio ou silêncio.")
+        return
+        
+    global_scale = 0.95 / global_peak
+    audio_norm = audio * global_scale # Aplica ganho uma vez
+    print(f"Normalização Global aplicada. Ganho: {global_scale:.2f}x")
 
     total_samples = audio.shape[1]
     chunk_samples = int(CONFIG["CHUNK_SIZE"] * sr)
@@ -140,29 +151,25 @@ def process_file(file_path, model):
     except:
         cpu_dev, gpu_dev = None, None
 
-    print("A iniciar inferência com Normalização por Chunk...")
+    print("A iniciar inferência...")
     for i in tqdm(range(0, total_samples - chunk_samples + 1, hop_samples)):
-        # 1. Extrair Chunk
-        chunk = audio[:, i : i + chunk_samples]
+        # 3. Extrair Chunk já normalizado
+        chunk = audio_norm[:, i : i + chunk_samples]
         
-        # 2. Normalização Local (CRÍTICO: Igual ao Treino)
-        chunk_peak = np.max(np.abs(chunk))
-        scale_factor = 1.0
-        if chunk_peak > 1e-8:
-            scale_factor = 0.95 / chunk_peak
-            chunk = chunk * scale_factor
+        # (Removemos a normalização local daqui!)
         
         # Preparar para JAX
         chunk_jax = jnp.array(chunk)[None, ...]
         
-        # 3. Processamento
         # STFT no CPU
         spec_jax = cpu_stft_jax(chunk_jax)
+        
         # Modelo na GPU
         if gpu_dev: spec_gpu = jax.device_put(spec_jax, gpu_dev)
         else: spec_gpu = spec_jax
         
         key, subkey = jax.random.split(key)
+        # Passos da ODE
         rec_spec_gpu = predict_spectrogram(model, spec_gpu, subkey, CONFIG["ODE_STEPS"])
         
         # ISTFT no CPU
@@ -172,20 +179,23 @@ def process_file(file_path, model):
         
         rec_audio = np.array(rec_audio_jax[0])
         
-        # 4. Desnormalização (Restaurar volume original)
-        rec_audio = rec_audio / scale_factor
+        # (Não desnormalizamos aqui, fazemos no fim)
         
         # Overlap-Add
         valid_len = min(rec_audio.shape[1], chunk_samples)
         output_buffer[:, i : i + valid_len] += rec_audio[:, :valid_len] * window[:valid_len]
         weight_buffer[i : i + valid_len] += window[:valid_len]
 
+    # Evitar divisão por zero
     weight_buffer[weight_buffer < 1e-8] = 1.0
     output_buffer /= weight_buffer
     
-    out_name = file_path.rsplit('.', 1)[0] + "_DGAS_OUT.wav"
+    # 4. Desnormalização Global (Restaurar volume original)
+    output_buffer = output_buffer / global_scale
+    
+    out_name = file_path.rsplit('.', 1)[0] + "_DGAS_FIXED.wav"
     sf.write(out_name, output_buffer.T, sr)
-    print(f"✅ Salvo: {out_name}")
+    print(f"✅ Salvo sem ruído: {out_name}")
 
 if __name__ == "__main__":
     generator = load_models()
