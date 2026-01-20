@@ -8,8 +8,7 @@ import shutil
 from dgas_model import Generator, Discriminator
 from dgas_data import AudioLoader
 
-# === DGAS 3.6: CYBERNETIC ADA ENGINE + MRSTFT + RE-COUPLING ===
-# Innovation: PID-Controlled ADA, Re-coupled Flow Matching, MRSTFT Loss
+# === DGAS 3.6.1: METRICS & LOGIC FIX ===
 
 CONFIG = {
     "DATA_DIR": "/workspace/musdb18hq/train",
@@ -17,55 +16,62 @@ CONFIG = {
     "SAVE_INTERVAL": 1000,
     "BATCH_SIZE": 16,     
     "STEPS": 1000000,
-    "WARMUP_STEPS": 5000, # Aumentado para garantir estabilidade física
+    "WARMUP_STEPS": 5000, 
     "N_FFT": 2048, "HOP_LENGTH": 512,
     
-    # Pesos
-    "LAMBDA_FLOW": 5.0,
-    "LAMBDA_MRSTFT": 20.0, # SOTA: Substitui APML/Phase simples
-    "LAMBDA_ADV": 1.0,     # Aumentado pois MRSTFT equilibra
+    "LAMBDA_FLOW": 10.0,   # Aumentado para priorizar física
+    "LAMBDA_MRSTFT": 5.0,  # Balanceado
+    "LAMBDA_ADV": 1.0,     
     "LAMBDA_R1": 10.0,   
     "R1_INTERVAL": 16,    
-    "TARGET_RATIO": 0.6   
 }
 
-# --- 1. SOTA: MULTI-RESOLUTION STFT LOSS ---
-# Essencial para eliminar ruídos metálicos e artefatos de fase
-def stft_loss_fn(pred_spec, target_spec, fft_size, hop_size):
-    # Reconstrói áudio aproximado (ISTFT -> STFT) ou opera no espectro se compatível
-    # Aqui aplicamos perda espectral direta nas magnitudes
-    # Para simplicidade e velocidade em JAX, calculamos a perda na magnitude Log e Linear
-    
-    # Nota: Como o modelo opera no domínio STFT fixo (2048), a MRSTFT ideal requereria ISTFT->MultiSTFT.
-    # Para evitar custo proibitivo de ISTFT no loop, usamos uma aproximação multi-escala no próprio espectrograma:
-    # Average Pooling no espectrograma simula janelas maiores no tempo/frequência.
-    
-    diff = pred_spec - target_spec
-    l1_loss = jnp.mean(jnp.abs(diff))
-    
-    # Log-Mag Loss
-    mag_pred = jnp.abs(pred_spec) + 1e-7
-    mag_target = jnp.abs(target_spec) + 1e-7
-    log_loss = jnp.mean(jnp.abs(jnp.log(mag_pred) - jnp.log(mag_target)))
-    
-    return l1_loss + log_loss
+# --- 1. SOTA: MRSTFT CORRECT IMPLEMENTATION ---
 
-def compute_mrstft_loss(pred, target):
-    # Simulação eficiente de MRSTFT no domínio latente espectral
-    # Escala 1: Full Res
-    l1 = stft_loss_fn(pred, target, 2048, 512)
+def complex_mag(spec):
+    """
+    Calcula magnitude correta para input de 4 canais (L_re, L_im, R_re, R_im).
+    Retorna (B, 2, F, T) -> Mag_L, Mag_R
+    """
+    l_re, l_im = spec[:, 0], spec[:, 1]
+    r_re, r_im = spec[:, 2], spec[:, 3]
+    # Epsilon seguro para gradientes
+    mag_l = jnp.sqrt(l_re**2 + l_im**2 + 1e-6)
+    mag_r = jnp.sqrt(r_re**2 + r_im**2 + 1e-6)
+    return jnp.stack([mag_l, mag_r], axis=1)
+
+def stft_loss_fn(mag_pred, mag_target):
+    """
+    Calcula L1 e Log-L1 na magnitude (Spectral Convergence + Log Scale).
+    """
+    # L1 Loss (Spectral Convergence)
+    sc_loss = jnp.mean(jnp.abs(mag_pred - mag_target)) / (jnp.mean(jnp.abs(mag_target)) + 1e-6)
+    # Log L1 Loss
+    log_loss = jnp.mean(jnp.abs(jnp.log(mag_pred + 1e-6) - jnp.log(mag_target + 1e-6)))
+    return sc_loss + log_loss
+
+def compute_mrstft_loss(pred_complex, target_complex):
+    # 1. Converter para Magnitude FÍSICA
+    m_pred = complex_mag(pred_complex)    # (B, 2, F, T)
+    m_target = complex_mag(target_complex)
     
-    # Escala 2: Tempo Baixo (Avg Pool Time)
-    p_t = jax.nn.avg_pool(pred, (1, 2), strides=(1, 2), padding='SAME')
-    t_t = jax.nn.avg_pool(target, (1, 2), strides=(1, 2), padding='SAME')
-    l2 = stft_loss_fn(p_t, t_t, 0, 0)
+    # Scale 1: Full Resolution
+    loss_1 = stft_loss_fn(m_pred, m_target)
     
-    # Escala 3: Frequência Baixa (Avg Pool Freq)
-    p_f = jax.nn.avg_pool(pred, (2, 1), strides=(2, 1), padding='SAME')
-    t_f = jax.nn.avg_pool(target, (2, 1), strides=(2, 1), padding='SAME')
-    l3 = stft_loss_fn(p_f, t_f, 0, 0)
+    # Scale 2: Pooling Time (simula janela maior)
+    # Pooling deve ser aplicado a (F, T) -> eixos 2 e 3
+    # window=(1, 1, 1, 2) -> (B, C, F, T) -> Pooling em T
+    p_t = jax.nn.avg_pool(m_pred, window_shape=(1, 1, 1, 4), strides=(1, 1, 1, 2), padding='SAME')
+    t_t = jax.nn.avg_pool(m_target, window_shape=(1, 1, 1, 4), strides=(1, 1, 1, 2), padding='SAME')
+    loss_2 = stft_loss_fn(p_t, t_t)
     
-    return l1 + l2 + l3
+    # Scale 3: Pooling Freq (simula bandas mais largas)
+    # window=(1, 1, 4, 1) -> Pooling em F
+    p_f = jax.nn.avg_pool(m_pred, window_shape=(1, 1, 4, 1), strides=(1, 1, 2, 1), padding='SAME')
+    t_f = jax.nn.avg_pool(m_target, window_shape=(1, 1, 4, 1), strides=(1, 1, 2, 1), padding='SAME')
+    loss_3 = stft_loss_fn(p_f, t_f)
+    
+    return loss_1 + loss_2 + loss_3
 
 def gpu_stft(audio):
     window = jnp.hanning(CONFIG["N_FFT"])
@@ -76,7 +82,7 @@ def gpu_stft(audio):
     spec = jnp.transpose(spec, (0, 1, 4, 2, 3)).reshape(B, C * 2, F, T)
     return spec[:, :, :, :128] * 10.0
 
-# --- 2. DIFFERENTIABLE AUGMENTATION (ADA) ---
+# --- 2. AUGMENTATION ---
 def diff_spec_augment(x, key, strength):
     B, C, F, T = x.shape
     k1, k2, k3 = jax.random.split(key, 3)
@@ -84,19 +90,15 @@ def diff_spec_augment(x, key, strength):
     f_width = int(F * 0.2) 
     f_pos = jax.random.randint(k2, (B, 1, 1, 1), 0, F - f_width)
     freq_grid = jnp.arange(F)[None, None, :, None]
-    mask_vals = (freq_grid >= f_pos) & (freq_grid < (f_pos + f_width * strength)) 
-    f_mask = jnp.where(mask_vals, 0.0, 1.0)
+    f_mask = jnp.where((freq_grid >= f_pos) & (freq_grid < (f_pos + f_width * strength)), 0.0, 1.0)
     
     t_width = int(T * 0.2)
     t_pos = jax.random.randint(k3, (B, 1, 1, 1), 0, T - t_width)
     time_grid = jnp.arange(T)[None, None, None, :]
-    mask_vals_t = (time_grid >= t_pos) & (time_grid < (t_pos + t_width * strength))
-    t_mask = jnp.where(mask_vals_t, 0.0, 1.0)
-    x_aug = x * f_mask * t_mask
-    return jnp.where(do_aug, x_aug, x)
+    t_mask = jnp.where((time_grid >= t_pos) & (time_grid < (t_pos + t_width * strength)), 0.0, 1.0)
+    return jnp.where(do_aug, x * f_mask * t_mask, x)
 
-# --- 3. LOSSES (COM ADA & RE-COUPLING) ---
-
+# --- 3. LOSSES ---
 def compute_disc_loss(discriminator, generator, mix_spec, target_spec, key, do_r1, aug_strength):
     z = jax.vmap(generator.encoder)(mix_spec)
     B, _, F, T = target_spec.shape
@@ -111,10 +113,9 @@ def compute_disc_loss(discriminator, generator, mix_spec, target_spec, key, do_r
     grid_f, grid_t = jnp.meshgrid(freqs, times, indexing='ij')
     ff, tt = grid_f.flatten(), grid_t.flatten()
     
-    # SOTA: Re-acoplamento no Generator (Passamos x_t_flat)
+    # Re-acoplamento correto no treino
     def predict_batch(ti, xti, zi):
-        xti_flat = xti.reshape(4, -1).T # (F*T, 4)
-        # O gerador agora recebe o valor do sinal xti_flat
+        xti_flat = xti.reshape(4, -1).T 
         v = jax.vmap(lambda f, t, x_val: generator.field(ti, jnp.array([t, f]), x_val, zi))(ff, tt, xti_flat)
         return v.T.reshape(4, F, T)
     v_pred = jax.vmap(predict_batch)(t, x_t, z)
@@ -125,17 +126,15 @@ def compute_disc_loss(discriminator, generator, mix_spec, target_spec, key, do_r
     real_scores = jax.vmap(discriminator)(target_aug, mix_spec)
     fake_scores = jax.vmap(discriminator)(fake_aug, mix_spec)
     
-    def compute_r1_penalty():
-        def single_disc_score(x, c): return jnp.squeeze(discriminator(x, c)) 
-        grads = jax.vmap(jax.grad(single_disc_score), in_axes=(0, 0))(target_spec, mix_spec)
-        grads_flat = grads.reshape(B, -1)
-        penalty = jnp.mean(jnp.sum(grads_flat ** 2, axis=1))
-        return penalty * CONFIG["LAMBDA_R1"] * 0.5
-
-    r1_penalty = jax.lax.cond(do_r1, compute_r1_penalty, lambda: 0.0)
     d_loss = jnp.mean(jax.nn.relu(1.0 - real_scores)) + jnp.mean(jax.nn.relu(1.0 + fake_scores))
     
-    return d_loss + r1_penalty, d_loss
+    # R1 Penalty condicional
+    def compute_r1():
+        grads = jax.vmap(jax.grad(lambda x, c: jnp.squeeze(discriminator(x, c))), in_axes=(0, 0))(target_spec, mix_spec)
+        return jnp.mean(jnp.sum(grads.reshape(B, -1)**2, axis=1)) * CONFIG["LAMBDA_R1"] * 0.5
+    r1 = jax.lax.cond(do_r1, compute_r1, lambda: 0.0)
+    
+    return d_loss + r1, (d_loss, r1)
 
 def compute_gen_loss(generator, discriminator, mix_spec, target_spec, key, step, aug_strength):
     z = jax.vmap(generator.encoder)(mix_spec)
@@ -145,40 +144,45 @@ def compute_gen_loss(generator, discriminator, mix_spec, target_spec, key, step,
     x0 = jax.random.normal(key, target_spec.shape)
     t_b = t[:, None, None, None]
     x_t = t_b * target_spec + (1.0 - t_b) * x0
-    v_target = target_spec - x0
+    v_target = target_spec - x0 # Velocity Target
     
     freqs, times = jnp.linspace(0, 1, F), jnp.linspace(0, 1, T)
     grid_f, grid_t = jnp.meshgrid(freqs, times, indexing='ij')
     ff, tt = grid_f.flatten(), grid_t.flatten()
     
-    # SOTA: Re-acoplamento no Generator
     def predict_batch(ti, xti, zi):
         xti_flat = xti.reshape(4, -1).T
         v = jax.vmap(lambda f, t, x_val: generator.field(ti, jnp.array([t, f]), x_val, zi))(ff, tt, xti_flat)
         return v.T.reshape(4, F, T)
     v_pred = jax.vmap(predict_batch)(t, x_t, z)
     
-    # Losses Físicas
+    # --- MÉTRICAS DE LOSS ---
+    # 1. Flow Matching (MSE)
     flow_loss = jnp.mean((v_pred - v_target)**2)
     
-    # SOTA: MRSTFT Loss (Substitui a loss simples de magnitude)
+    # 2. MRSTFT Loss (Magnitude Multi-Resolution)
     mrstft_loss = compute_mrstft_loss(v_pred, v_target)
     
-    # Adversarial Loss
+    # 3. Phase Consistency (Cosine Sim)
+    # Mede se os vetores apontam para o mesmo lado, independente da magnitude
+    dot = jnp.sum(v_pred * v_target, axis=1)
+    norm_p = jnp.linalg.norm(v_pred, axis=1) + 1e-6
+    norm_t = jnp.linalg.norm(v_target, axis=1) + 1e-6
+    phase_loss = jnp.mean(1.0 - (dot / (norm_p * norm_t)))
+    
+    # 4. Adversarial Loss
     fake_aug = diff_spec_augment(v_pred, k_aug, aug_strength)
     fake_score = jax.vmap(discriminator)(fake_aug, mix_spec)
     adv_loss = -jnp.mean(fake_score)
     
-    # SOTA: Warmup Schedule Rigoroso
-    # Durante warmup, adversarial loss é ZERO para permitir que o modelo aprenda física primeiro
-    is_warmup = step < CONFIG["WARMUP_STEPS"]
-    adv_weight = jax.lax.cond(is_warmup, lambda: 0.0, lambda: CONFIG["LAMBDA_ADV"])
+    adv_weight = jax.lax.cond(step < CONFIG["WARMUP_STEPS"], lambda: 0.0, lambda: CONFIG["LAMBDA_ADV"])
     
     total = (CONFIG["LAMBDA_FLOW"] * flow_loss + 
              CONFIG["LAMBDA_MRSTFT"] * mrstft_loss + 
              adv_weight * adv_loss)
              
-    return total, (flow_loss, mrstft_loss, 0.0, adv_loss)
+    # Retorna todas as métricas individuais
+    return total, (flow_loss, mrstft_loss, phase_loss, adv_loss)
 
 # --- 4. STEP DE TREINO ---
 @eqx.filter_jit
@@ -189,50 +193,41 @@ def train_step(gen, disc, opt_gen, opt_disc, optim_gen, optim_disc, mix_wav, tar
     do_r1 = (step % CONFIG["R1_INTERVAL"] == 0)
     pid_int, aug_strength = pid_state
     
-    # Update Discriminador (Condicional ao Warmup)
-    # SOTA: Disc não treina durante warmup do Generator
+    # Disc Update
     def update_disc(d, g, o_state):
-        (loss, clean_d_loss), grads = eqx.filter_value_and_grad(compute_disc_loss, has_aux=True)(d, g, mix_spec, target_spec, k1, do_r1, aug_strength)
+        (loss, (clean_d_loss, r1)), grads = eqx.filter_value_and_grad(compute_disc_loss, has_aux=True)(d, g, mix_spec, target_spec, k1, do_r1, aug_strength)
         updates, new_state = optim_disc.update(grads, o_state, d)
         new_d = eqx.apply_updates(d, updates)
-        return new_d, new_state, clean_d_loss
+        return new_d, new_state, clean_d_loss, r1
 
-    # Update Generator
-    (g_loss, aux), grads_g = eqx.filter_value_and_grad(compute_gen_loss, has_aux=True)(gen, disc, mix_spec, target_spec, k2, step, aug_strength)
+    # Gen Update
+    (g_loss, gen_metrics), grads_g = eqx.filter_value_and_grad(compute_gen_loss, has_aux=True)(gen, disc, mix_spec, target_spec, k2, step, aug_strength)
     updates_g, new_opt_gen = optim_gen.update(grads_g, opt_gen, gen)
     new_gen = eqx.apply_updates(gen, updates_g)
     
-    flow, mrstft, _, g_adv_loss = aux
-    
-    # Executa update do disc apenas após warmup
-    new_disc, new_opt_disc, final_d_loss = jax.lax.cond(
+    # Executa Disc update condicional
+    new_disc, new_opt_disc, d_loss, r1_val = jax.lax.cond(
         step >= CONFIG["WARMUP_STEPS"],
         lambda: update_disc(disc, gen, opt_disc),
-        lambda: (disc, opt_disc, 1.0) # Dummy loss 1.0
+        lambda: (disc, opt_disc, 1.0, 0.0)
     )
     
-    # PID ADA Logic
+    # PID Control
     target_d_loss = 0.4 
-    error = target_d_loss - final_d_loss
-    Kp, Ki = 0.2, 0.05
-    p_term = error * Kp 
-    new_int = jnp.clip(pid_int + error * Ki, -2.0, 5.0)
-    raw_aug = (new_int * 0.2) + p_term
-    new_aug_strength = jnp.clip(raw_aug, 0.0, 0.8)
-    new_aug_strength = jax.lax.cond(step < CONFIG["WARMUP_STEPS"], lambda: 0.0, lambda: new_aug_strength)
-    new_pid_state = (new_int, new_aug_strength)
+    error = target_d_loss - d_loss
+    new_int = jnp.clip(pid_int + error * 0.05, -2.0, 5.0)
+    raw_aug = (new_int * 0.2) + (error * 0.2)
+    new_aug = jnp.clip(raw_aug, 0.0, 0.8)
+    new_aug = jax.lax.cond(step < CONFIG["WARMUP_STEPS"], lambda: 0.0, lambda: new_aug)
     
-    return new_gen, new_disc, new_opt_gen, new_opt_disc, g_loss, final_d_loss, aux, new_pid_state
+    return new_gen, new_disc, new_opt_gen, new_opt_disc, g_loss, d_loss, r1_val, gen_metrics, (new_int, new_aug)
 
-# --- MAIN LOOP ---
+# --- MAIN ---
 def main():
-    print(f"=== DGAS 3.6: SOTA ENGINE ACTIVATED ===")
+    print(f"=== DGAS 3.6.1: FULL METRICS & LOGIC FIX ===")
     
-    if os.path.exists(CONFIG['CHECKPOINT_DIR']):
-        shutil.rmtree(CONFIG['CHECKPOINT_DIR'])
+    if os.path.exists(CONFIG['CHECKPOINT_DIR']): shutil.rmtree(CONFIG['CHECKPOINT_DIR'])
     os.makedirs(CONFIG['CHECKPOINT_DIR'], exist_ok=True)
-
-    print(f"🚀 Device: {jax.devices()[0]}")
     
     key = jax.random.PRNGKey(42)
     k_gen, k_disc, k_loop = jax.random.split(key, 3)
@@ -240,16 +235,13 @@ def main():
     gen = Generator(key=k_gen)
     disc = Discriminator(key=k_disc)
     
-    lr_schedule = optax.warmup_cosine_decay_schedule(1e-5, 1e-4, 1000, CONFIG["STEPS"], 1e-6)
+    lr = optax.warmup_cosine_decay_schedule(1e-5, 1e-4, 1000, CONFIG["STEPS"], 1e-6)
+    optim = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(lr, b1=0.5, b2=0.9))
     
-    optim_gen = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(lr_schedule, b1=0.5, b2=0.9))
-    optim_disc = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(lr_schedule, b1=0.5, b2=0.9))
-    
-    opt_gen_state = optim_gen.init(eqx.filter(gen, eqx.is_array))
-    opt_disc_state = optim_disc.init(eqx.filter(disc, eqx.is_array))
+    opt_gen_state = optim.init(eqx.filter(gen, eqx.is_array))
+    opt_disc_state = optim.init(eqx.filter(disc, eqx.is_array))
     
     pid_state = (0.0, 0.0)
-    
     loader = AudioLoader(CONFIG["DATA_DIR"], CONFIG["BATCH_SIZE"])
     loader.start()
     
@@ -261,34 +253,24 @@ def main():
             k_loop, subkey = jax.random.split(k_loop)
             
             start = time.time()
-            
-            gen, disc, opt_gen_state, opt_disc_state, g_loss, d_loss, aux, pid_state = train_step(
-                gen, disc, opt_gen_state, opt_disc_state, optim_gen, optim_disc,
+            gen, disc, opt_gen_state, opt_disc_state, g_loss, d_loss, r1, (flow, mrs, phase, adv), pid_state = train_step(
+                gen, disc, opt_gen_state, opt_disc_state, optim, optim,
                 mix, tgt, subkey, jnp.array(step), pid_state
             )
-            
             jax.block_until_ready(g_loss)
             dt = time.time() - start
             step += 1
             
+            # PRINT COM TODAS AS MÉTRICAS
             if step % 10 == 0:
-                flow, mrstft, _, adv = aux
-                # Status update: MRSTFT substitui APML
-                print(f"S{step:05d} | GL:{g_loss:.3f} | DL:{d_loss:.3f} | F:{flow:.3f} | MRS:{mrstft:.3f} | ADA:{pid_state[1]:.3f} | {dt*1000:.0f}ms")
+                print(f"S{step:05d} | G:{g_loss:.2f} D:{d_loss:.2f} | FL:{flow:.2f} MRS:{mrs:.2f} PH:{phase:.3f} ADV:{adv:.3f} | R1:{r1:.1f} ADA:{pid_state[1]:.2f} | {dt*1000:.0f}ms")
                 
             if step % CONFIG["SAVE_INTERVAL"] == 0:
-                ckpt_path = os.path.join(CONFIG["CHECKPOINT_DIR"], "dgas_latest.eqx")
-                temp_path = ckpt_path + ".tmp"
-                eqx.tree_serialise_leaves(temp_path, (gen, disc))
-                os.replace(temp_path, ckpt_path)
-                if step % 5000 == 0:
-                    shutil.copy(ckpt_path, os.path.join(CONFIG["CHECKPOINT_DIR"], f"dgas_step_{step:06d}.eqx"))
-                print(f"💾 CHECKPOINT GUARDADO: Step {step}")
+                eqx.tree_serialise_leaves(os.path.join(CONFIG["CHECKPOINT_DIR"], "dgas_latest.eqx"), (gen, disc))
+                print(f"💾 Checkpoint: {step}")
 
-    except KeyboardInterrupt:
-        print("Interrompido.")
-    finally:
-        loader.stop()
+    except KeyboardInterrupt: pass
+    finally: loader.stop()
 
 if __name__ == "__main__":
     main()
