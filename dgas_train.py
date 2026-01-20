@@ -18,23 +18,17 @@ CONFIG = {
     "N_FFT": 2048, "HOP_LENGTH": 512,
     
     "LAMBDA_FLOW": 10.0,
-    "LAMBDA_MRSTFT": 10.0,  # Aumenta o foco na qualidade de áudio
+    "LAMBDA_MRSTFT": 10.0,
     "LAMBDA_ADV": 0.05,   
     "LAMBDA_R1": 10.0,   
     "R1_INTERVAL": 16,    
 }
 
-# --- AUX: LOG COORDINATES (SOTA) ---
+# --- AUX: LOG COORDINATES ---
 def get_log_coords(F, T):
-    # Eixo Tempo: Linear
     times = jnp.linspace(0, 1, T)
-    
-    # Eixo Frequência: Logarítmico
-    # Mapeia linear [0, 1] para log [0, 1]
-    # Usamos log1p para suavizar a curva perto de zero
     linear_freqs = jnp.linspace(0, 1, F)
     log_freqs = jnp.log1p(linear_freqs * 10.0) / jnp.log1p(10.0)
-    
     return log_freqs, times
 
 # --- STFT LOSSES ---
@@ -51,38 +45,22 @@ def stft_loss_fn(mag_pred, mag_target):
     return sc_loss + log_loss
 
 def safe_avg_pool(x, window_shape, strides):
-    # Otimização A100: Calcular count apenas espacialmente (1, 1, F, T)
-    # Evita que o XLA tente fazer constant-folding de tensores gigantes (Batch*Chan)
     B, C, F, T = x.shape
-    
-    # 1. Soma os valores (mantém shape original B,C,F',T')
     val = jax.lax.reduce_window(x, 0.0, jax.lax.add, window_shape, strides, 'SAME')
-    
-    # 2. Cria ones apenas espacial (muito mais leve para o compilador)
     ones_spatial = jnp.ones((1, 1, F, T))
-    
-    # 3. Calcula count espacial
     count = jax.lax.reduce_window(ones_spatial, 0.0, jax.lax.add, window_shape, strides, 'SAME')
-    
-    # JAX faz broadcast automático na divisão: (B,C,F',T') / (1,1,F',T')
     return val / (count + 1e-6)
 
-# --- FUNÇÃO DE LOSS CORRIGIDA ---
 def compute_mrstft_loss(pred_complex, target_complex):
-    m_pred = complex_mag(pred_complex)     # Shape: (B, 2, F, T)
-    m_target = complex_mag(target_complex) # Shape: (B, 2, F, T)
+    m_pred = complex_mag(pred_complex)
+    m_target = complex_mag(target_complex)
     
-    # Scale 1: Full Resolution
     loss_1 = stft_loss_fn(m_pred, m_target)
     
-    # Scale 2: Pooling Time (Downsample T por 2)
-    # Janela (1, 1, 1, 4) -> (Batch, Channel, Freq, Time)
     p_t = safe_avg_pool(m_pred, (1, 1, 1, 4), (1, 1, 1, 2))
     t_t = safe_avg_pool(m_target, (1, 1, 1, 4), (1, 1, 1, 2))
     loss_2 = stft_loss_fn(p_t, t_t)
     
-    # Scale 3: Pooling Freq (Downsample F por 2)
-    # Janela (1, 1, 4, 1) -> (Batch, Channel, Freq, Time)
     p_f = safe_avg_pool(m_pred, (1, 1, 4, 1), (1, 1, 2, 1))
     t_f = safe_avg_pool(m_target, (1, 1, 4, 1), (1, 1, 2, 1))
     loss_3 = stft_loss_fn(p_f, t_f)
@@ -90,7 +68,6 @@ def compute_mrstft_loss(pred_complex, target_complex):
     return loss_1 + loss_2 + loss_3
 
 def gpu_stft(audio):
-    # Fonte da Verdade: JAX STFT
     window = jnp.hanning(CONFIG["N_FFT"])
     f, t, Zxx = jax.scipy.signal.stft(audio, fs=44100, window=window, nperseg=CONFIG["N_FFT"], noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"])
     Zxx = jnp.transpose(Zxx, (0, 1, 2, 3))
@@ -121,7 +98,6 @@ def compute_disc_loss(discriminator, generator, mix_spec, target_spec, key, do_r
     t_b = t[:, None, None, None]
     x_t = t_b * target_spec + (1.0 - t_b) * x0
     
-    # LOG COORDS
     freqs, times = get_log_coords(F, T)
     grid_f, grid_t = jnp.meshgrid(freqs, times, indexing='ij')
     ff, tt = grid_f.flatten(), grid_t.flatten()
@@ -157,7 +133,6 @@ def compute_gen_loss(generator, discriminator, mix_spec, target_spec, key, step,
     x_t = t_b * target_spec + (1.0 - t_b) * x0
     v_target = target_spec - x0
     
-    # LOG COORDS
     freqs, times = get_log_coords(F, T)
     grid_f, grid_t = jnp.meshgrid(freqs, times, indexing='ij')
     ff, tt = grid_f.flatten(), grid_t.flatten()
@@ -172,13 +147,11 @@ def compute_gen_loss(generator, discriminator, mix_spec, target_spec, key, step,
     flow_loss = jnp.mean((v_pred - v_target)**2)
     mrstft_loss = compute_mrstft_loss(v_pred, v_target)
     
-    # MELHORIA 2: Curriculum Learning para Phase Loss
     dot = jnp.sum(v_pred * v_target, axis=1)
     norm_p = jnp.linalg.norm(v_pred, axis=1) + 1e-6
     norm_t = jnp.linalg.norm(v_target, axis=1) + 1e-6
     raw_phase_loss = jnp.mean(1.0 - (dot / (norm_p * norm_t)))
     
-    # Começa em 0, sobe linearmente até step 10k
     phase_weight = jnp.clip(step / 10000.0, 0.0, 1.0) * 1.0 
     
     fake_aug = diff_spec_augment(v_pred, k_aug, aug_strength)
@@ -225,43 +198,80 @@ def train_step(gen, disc, opt_gen, opt_disc, optim_gen, optim_disc, mix_wav, tar
     
     return new_gen, new_disc, new_opt_gen, new_opt_disc, g_loss, d_loss, r1_val, gen_metrics, (new_int, new_aug)
 
+# --- MAIN CORRIGIDO ---
 def main():
-    print(f"=== DGAS 3.6.3: A100 OPTIMIZED (LogCoords, PhaseCurr, GPU-STFT) ===")
-    if os.path.exists(CONFIG['CHECKPOINT_DIR']): shutil.rmtree(CONFIG['CHECKPOINT_DIR'])
+    print(f"=== DGAS 3.6.4: RESTART & STABILIZE (AdamW + Weight Monitor) ===")
+    
+    # 1. Limpeza de checkpoints antigos (Crucial para não carregar pesos corrompidos)
+    if os.path.exists(CONFIG['CHECKPOINT_DIR']): 
+        shutil.rmtree(CONFIG['CHECKPOINT_DIR'])
+        print("🗑️  Checkpoints antigos removidos (Restart limpo).")
     os.makedirs(CONFIG['CHECKPOINT_DIR'], exist_ok=True)
+    
     key = jax.random.PRNGKey(42)
     k_gen, k_disc, k_loop = jax.random.split(key, 3)
+    
+    # Inicialização dos Modelos
     gen = Generator(key=k_gen)
     disc = Discriminator(key=k_disc)
     
-    # Aumentei o Learning Rate pois o Batch Size em A100 pode ser maior
+    # 2. OPTIMIZER CORRIGIDO: AdamW com Weight Decay
+    # O Weight Decay (1e-4) impede que os pesos explodam para valores como 11.0 ou 19.0
     lr = optax.warmup_cosine_decay_schedule(1e-5, 3e-4, 2000, CONFIG["STEPS"], 1e-6)
-    optim = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(lr, b1=0.5, b2=0.9))
+    
+    # Alteração: Mudança de optax.adam para optax.adamw
+    optim = optax.chain(
+        optax.clip_by_global_norm(1.0), 
+        optax.adamw(lr, b1=0.5, b2=0.9, weight_decay=1e-4)
+    )
     
     opt_gen_state = optim.init(eqx.filter(gen, eqx.is_array))
     opt_disc_state = optim.init(eqx.filter(disc, eqx.is_array))
     pid_state = (0.0, 0.0)
+    
     loader = AudioLoader(CONFIG["DATA_DIR"], CONFIG["BATCH_SIZE"])
     loader.start()
     step = 0
+    
     try:
         while step < CONFIG["STEPS"]:
             mix, tgt = loader.get_batch()
             mix, tgt = jnp.array(mix), jnp.array(tgt)
             k_loop, subkey = jax.random.split(k_loop)
+            
             start = time.time()
             gen, disc, opt_gen_state, opt_disc_state, g_loss, d_loss, r1, (flow, mrs, phase, adv), pid_state = train_step(
                 gen, disc, opt_gen_state, opt_disc_state, optim, optim,
                 mix, tgt, subkey, jnp.array(step), pid_state
             )
+            # Força o JAX a calcular para medir o tempo real
             jax.block_until_ready(g_loss)
             dt = time.time() - start
             step += 1
+            
+            # --- MONITORIZAÇÃO ---
             if step % 10 == 0:
                 print(f"S{step:05d} | G:{g_loss:.2f} D:{d_loss:.2f} | FL:{flow:.2f} MRS:{mrs:.2f} PH:{phase:.3f} | ADA:{pid_state[1]:.2f} | {dt*1000:.0f}ms")
+            
+            # --- HEALTH CHECK (Verificar se pesos estão a explodir) ---
+            if step % 100 == 0:
+                # Calcula a média absoluta dos pesos
+                params = eqx.filter(gen, eqx.is_array)
+                leaves = jax.tree_util.tree_leaves(params)
+                # Média das médias das folhas (rápido de calcular)
+                mean_w = jnp.mean(jnp.stack([jnp.mean(jnp.abs(x)) for x in leaves]))
+                
+                # Se os pesos passarem de 1.0 (geralmente devem estar < 0.1), algo está mal
+                if mean_w > 1.0:
+                    print(f"⚠️  PERIGO: Pesos a crescer demasiado (Mean: {mean_w:.2f}). O modelo pode estar a divergir!")
+                elif step % 1000 == 0:
+                    print(f"🩺 Health Check: Pesos estáveis (Mean: {mean_w:.4f})")
+
+            # --- SAVE ---
             if step % CONFIG["SAVE_INTERVAL"] == 0:
                 eqx.tree_serialise_leaves(os.path.join(CONFIG["CHECKPOINT_DIR"], "dgas_latest.eqx"), (gen, disc))
                 print(f"💾 Checkpoint: {step}")
+                
     except KeyboardInterrupt: pass
     finally: loader.stop()
 
