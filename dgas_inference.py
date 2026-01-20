@@ -4,16 +4,18 @@ import equinox as eqx
 import numpy as np
 import librosa
 import soundfile as sf
-import scipy.signal
 import os
 from tqdm import tqdm
 from dgas_model import Generator, Discriminator
+
+# Configuração Global
+jax.config.update("jax_platform_name", "gpu") 
 
 CONFIG = {
     "CHECKPOINT": "checkpoints/dgas_test.eqx", 
     "N_FFT": 2048,
     "HOP_LENGTH": 512,
-    "CHUNK_SIZE": 1.5,
+    "CHUNK_SIZE": 1.5,   # IMPORTANTE: 1.5s igual ao treino
     "OVERLAP": 0.5,
     "ODE_STEPS": 32, 
     "TARGET_SR": 44100
@@ -31,38 +33,52 @@ def load_models():
     except FileNotFoundError:
         raise FileNotFoundError(f"Erro: Checkpoint não encontrado em {CONFIG['CHECKPOINT']}")
 
-# --- CPU SIGNAL PROCESSING (Scipy) ---
-# Movemos isto para CPU para evitar o crash do cuFFT na A100
-def cpu_stft(audio):
-    # audio shape: (2, N)
-    f, t, Zxx = scipy.signal.stft(
-        audio, 
-        fs=CONFIG["TARGET_SR"], 
-        window='hann', 
-        nperseg=CONFIG["N_FFT"], 
-        noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"],
-        boundary='zeros',
-        padded=True
-    )
-    # Zxx shape: (2, F, T) -> complexo
-    # Converter para formato do modelo: (1, 4, F, T) -> [L_real, L_imag, R_real, R_imag]
-    spec_l = Zxx[0]
-    spec_r = Zxx[1]
-    spec = np.stack([spec_l.real, spec_l.imag, spec_r.real, spec_r.imag], axis=0)
-    return spec[None, ...] # Adicionar Batch dim: (1, 4, F, T)
+# --- STFT/ISTFT HÍBRIDO (JAX CPU -> JAX GPU) ---
 
-def cpu_istft(spec_jax):
-    # spec_jax: (1, 4, F, T) -> vindo da GPU
-    spec = np.array(spec_jax[0]) # Converter para Numpy CPU
+# Definimos a função normalmente (sem decorador aqui)
+def cpu_stft_jax_impl(audio):
+    # audio: (1, 2, N) -> Batch, Channels, Samples
+    window = jnp.hanning(CONFIG["N_FFT"])
     
-    # Reconstruir complexos
-    l_complex = spec[0] + 1j * spec[1]
-    r_complex = spec[2] + 1j * spec[3]
+    f, t, Zxx = jax.scipy.signal.stft(
+        audio, 
+        fs=44100, 
+        window=window, 
+        nperseg=CONFIG["N_FFT"], 
+        noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"]
+    )
     
-    _, audio_l = scipy.signal.istft(l_complex, fs=CONFIG["TARGET_SR"], window='hann', nperseg=CONFIG["N_FFT"], noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"])
-    _, audio_r = scipy.signal.istft(r_complex, fs=CONFIG["TARGET_SR"], window='hann', nperseg=CONFIG["N_FFT"], noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"])
+    # Converter para formato do modelo: (B, 4, F, T) -> [L_real, L_imag, R_real, R_imag]
+    spec = jnp.stack([Zxx.real, Zxx.imag], axis=-1) # (1, 2, F, T, 2)
+    spec = jnp.transpose(spec, (0, 1, 4, 2, 3))     # (1, 2, 2, F, T)
     
-    return np.stack([audio_l, audio_r], axis=0)
+    B, C, _, F, T = spec.shape
+    return spec.reshape(B, C * 2, F, T)
+
+# Aplicamos o JIT com backend CPU explicitamente
+cpu_stft_jax = jax.jit(cpu_stft_jax_impl, backend='cpu')
+
+
+def cpu_istft_jax_impl(spec):
+    # spec: (1, 4, F, T)
+    B, _, F, T = spec.shape
+    spec = spec.reshape(B, 2, 2, F, T)
+    
+    Zxx = spec[:, :, 0] + 1j * spec[:, :, 1] # (1, 2, F, T)
+    
+    window = jnp.hanning(CONFIG["N_FFT"])
+    _, audio = jax.scipy.signal.istft(
+        Zxx, 
+        fs=44100, 
+        window=window, 
+        nperseg=CONFIG["N_FFT"], 
+        noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"]
+    )
+    return audio # (1, 2, N)
+
+# Aplicamos o JIT com backend CPU explicitamente
+cpu_istft_jax = jax.jit(cpu_istft_jax_impl, backend='cpu')
+
 
 def get_log_coords(F, T):
     times = jnp.linspace(0, 1, T)
@@ -70,10 +86,10 @@ def get_log_coords(F, T):
     log_freqs = jnp.log1p(linear_freqs * 10.0) / jnp.log1p(10.0)
     return log_freqs, times
 
-# --- GPU MODEL INFERENCE (Apenas Neural Net) ---
+# --- MODEL INFERENCE (GPU) ---
 @eqx.filter_jit
 def predict_spectrogram(model, mix_spec, key, steps):
-    # mix_spec já entra como (1, 4, F, T)
+    # mix_spec: (1, 4, F, T)
     cond = jax.vmap(model.encoder)(mix_spec) 
     x = jax.random.normal(key, mix_spec.shape)
     dt = 1.0 / steps
@@ -84,10 +100,15 @@ def predict_spectrogram(model, mix_spec, key, steps):
     f_flat, t_flat = grid_f.flatten(), grid_t.flatten()
     
     def get_velocity_single(t_curr, x_curr, cond_curr):
+        # x_curr: (4, F, T)
+        # Transpose para (F, T, 4) para alinhar com grid_f/grid_t
         x_flat = jnp.transpose(x_curr, (1, 2, 0)).reshape(-1, 4)
+        
         def field_point(f_val, t_val, x_val_i):
             return model.field(t_curr, jnp.array([t_val, f_val]), x_val_i, cond_curr)
+            
         v_flat = jax.vmap(field_point)(f_flat, t_flat, x_flat)
+        # Reconstrói (F, T, 4) -> Transpose (4, F, T)
         return jnp.transpose(v_flat.reshape(F, T, 4), (2, 0, 1))
 
     def loop_body(i, curr_x):
@@ -104,25 +125,19 @@ def predict_spectrogram(model, mix_spec, key, steps):
 def process_file(file_path, model):
     print(f"\n>>> A processar: {file_path}")
     
-    # 1. Carregar Audio
     try:
         audio, sr = librosa.load(file_path, sr=CONFIG["TARGET_SR"], mono=False)
     except Exception as e:
-        print(f"Erro ao abrir ficheiro: {e}")
+        print(f"Erro: {e}")
         return
 
-    if audio.ndim == 1:
-        print("Aviso: Audio Mono detetado. A converter para Stereo...")
-        audio = np.stack([audio, audio])
+    if audio.ndim == 1: audio = np.stack([audio, audio])
     
-    # 2. Normalização de Pico (ESSENCIAL)
+    # 1. Normalização Peak 0.95 (Crucial)
     original_peak = np.max(np.abs(audio))
     if original_peak > 0:
-        scale_factor = 0.95 / original_peak
-        audio = audio * scale_factor
-        print(f"Normalização aplicada: Peak {original_peak:.4f} -> 0.95")
-    else:
-        print("Aviso: Audio silencioso detetado.")
+        audio = audio * (0.95 / original_peak)
+        print(f"Normalização: {original_peak:.4f} -> 0.95")
 
     total_samples = audio.shape[1]
     chunk_samples = int(CONFIG["CHUNK_SIZE"] * sr)
@@ -134,25 +149,45 @@ def process_file(file_path, model):
     
     key = jax.random.PRNGKey(42)
     
-    print("A iniciar inferência (STFT CPU -> GPU Model -> ISTFT CPU)...")
+    print("A iniciar inferência...")
+    # Tenta obter o dispositivo CPU explicitamente
+    try:
+        cpu_device = jax.devices("cpu")[0]
+        gpu_device = jax.devices("gpu")[0]
+    except:
+        print("Aviso: Falha ao detetar dispositivos CPU/GPU específicos. A usar padrão.")
+        cpu_device = None
+        gpu_device = None
+
     for i in tqdm(range(0, total_samples - chunk_samples + 1, hop_samples)):
         chunk = audio[:, i : i + chunk_samples]
         
-        # 1. CPU STFT
-        spec_cpu = cpu_stft(chunk) # Retorna numpy array
+        # Preparar chunk (1, 2, N)
+        chunk_jax = jnp.array(chunk)[None, ...]
         
-        # 2. Envia para GPU
-        spec_jax = jnp.array(spec_cpu)
+        # 1. STFT (JAX on CPU)
+        spec_jax = cpu_stft_jax(chunk_jax)
         
-        # 3. Inferência Neural (Flow Matching)
+        # Mover para GPU
+        if gpu_device:
+            spec_gpu = jax.device_put(spec_jax, gpu_device)
+        else:
+            spec_gpu = spec_jax # Fallback
+
+        # 2. Inferência (GPU)
         key, subkey = jax.random.split(key)
-        rec_spec_jax = predict_spectrogram(model, spec_jax, subkey, CONFIG["ODE_STEPS"])
+        rec_spec_gpu = predict_spectrogram(model, spec_gpu, subkey, CONFIG["ODE_STEPS"])
         
-        # 4. CPU ISTFT
-        rec_audio = cpu_istft(rec_spec_jax)
+        # 3. ISTFT (JAX on CPU)
+        if cpu_device:
+            rec_spec_cpu = jax.device_put(rec_spec_gpu, cpu_device)
+        else:
+            rec_spec_cpu = rec_spec_gpu # Fallback
+            
+        rec_audio_jax = cpu_istft_jax(rec_spec_cpu)
         
-        # Overlap-Add
-        # Verifica tamanhos (pode haver pequenas diferenças de rounding no ISTFT)
+        rec_audio = np.array(rec_audio_jax[0])
+        
         valid_len = min(rec_audio.shape[1], chunk_samples)
         output_buffer[:, i : i + valid_len] += rec_audio[:, :valid_len] * window[:valid_len]
         weight_buffer[i : i + valid_len] += window[:valid_len]
@@ -162,7 +197,7 @@ def process_file(file_path, model):
     
     out_name = file_path.rsplit('.', 1)[0] + "_DGAS_OUT.wav"
     sf.write(out_name, output_buffer.T, sr)
-    print(f"✅ Sucesso! Salvo em: {out_name}")
+    print(f"✅ Salvo: {out_name}")
 
 if __name__ == "__main__":
     generator = load_models()
