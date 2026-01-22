@@ -17,23 +17,35 @@ class AudioLoader:
         self.track_folders = self._scan_musdb(data_dir)
         self.queue = queue.Queue(maxsize=100)
         self.running = False
-        print(f"Dataset: {len(self.track_folders)} faixas.")
+        print(f"Dataset: {len(self.track_folders)} faixas detectadas em {data_dir}")
 
     def _scan_musdb(self, directory: str):
         valid = []
-        if not os.path.exists(directory): return []
+        if not os.path.exists(directory): 
+            print(f"❌ ERRO: Diretoria {directory} não existe!")
+            return []
         for root, _, files in os.walk(directory):
             if 'mixture.wav' in files and 'vocals.wav' in files:
                 valid.append(root)
+        if not valid:
+            print("❌ AVISO: Nenhuma pasta com mixture.wav e vocals.wav encontrada!")
         return valid
 
     def _normalize_peak(self, mix, vox):
-        max_val = np.max(np.abs(mix))
-        # SILENCE FILTER: Se o audio for muito baixo (ruído de fundo), rejeitamos
-        if max_val < 0.05: 
-            return None, None 
+        max_mix = np.max(np.abs(mix))
+        max_vox = np.max(np.abs(vox))
         
-        scale = 0.95 / max_val
+        # FILTRO DE SILÊNCIO DUPLO
+        # 1. Se a mistura for silêncio, ignorar.
+        if max_mix < 0.05: 
+            return None, None
+            
+        # 2. CRÍTICO: Se o vocal for silêncio, ignorar para este treino.
+        # Se treinarmos com silêncio, o modelo aprende a gerar silêncio (ou v=0).
+        if max_vox < 0.01:
+            return None, None
+        
+        scale = 0.95 / (max_mix + 1e-8)
         return mix * scale, vox * scale
 
     def _load_chunk_pair(self, folder_path):
@@ -42,34 +54,34 @@ class AudioLoader:
             vox_path = os.path.join(folder_path, 'vocals.wav')
             info = sf.info(mix_path)
             
-            # Tentar encontrar um chunk válido (máximo 5 tentativas por ficheiro)
-            for _ in range(5):
+            for _ in range(10): # Tentar mais vezes encontrar uma parte com voz
                 if info.frames <= CHUNK_SAMPLES: start = 0
                 else: start = random.randint(0, info.frames - CHUNK_SAMPLES)
                 
                 mix, _ = sf.read(mix_path, start=start, frames=CHUNK_SAMPLES, dtype='float32', always_2d=True)
                 vox, _ = sf.read(vox_path, start=start, frames=CHUNK_SAMPLES, dtype='float32', always_2d=True)
                 
+                # Padding se necessário
                 if mix.shape[0] < CHUNK_SAMPLES:
                     pad = CHUNK_SAMPLES - mix.shape[0]
                     mix = np.pad(mix, ((0, pad), (0, 0)))
                     vox = np.pad(vox, ((0, pad), (0, 0)))
                 
+                # Stereo Check
                 if mix.shape[1] == 1:
                     mix = np.concatenate([mix, mix], axis=1)
                     vox = np.concatenate([vox, vox], axis=1)
                 elif mix.shape[1] > 2:
                     mix, vox = mix[:, :2], vox[:, :2]
                 
-                # Normaliza e verifica silêncio
                 res_mix, res_vox = self._normalize_peak(mix, vox)
                 if res_mix is not None:
                     return res_mix, res_vox
             
-            # Se falhar 5x, retorna zeros (será ignorado ou processado como silence training mínimo)
-            return np.zeros((CHUNK_SAMPLES, 2)), np.zeros((CHUNK_SAMPLES, 2))
-        except:
-            return np.zeros((CHUNK_SAMPLES, 2)), np.zeros((CHUNK_SAMPLES, 2))
+            return None, None # Falhou em encontrar voz
+        except Exception as e:
+            print(f"Erro a ler ficheiro {folder_path}: {e}")
+            return None, None
 
     def _worker(self):
         while self.running:
@@ -78,8 +90,8 @@ class AudioLoader:
                 if not self.track_folders: break
                 folder = random.choice(self.track_folders)
                 m, v = self._load_chunk_pair(folder)
-                # Verifica se não é silêncio absoluto antes de adicionar
-                if np.max(np.abs(m)) > 1e-6:
+                
+                if m is not None: # Só adiciona se for válido (não silêncio)
                     batch_m.append(m.T)
                     batch_v.append(v.T)
             
