@@ -20,7 +20,7 @@ CONFIG = {
     "ODE_STEPS": 64, 
     "TARGET_SR": 44100,
     # --- O SEGREDO DO SUCESSO ---
-    "SIGNAL_SCALE": 50.0  # Tem de ser IGUAL ao treino
+    "SIGNAL_SCALE": 5.0  # Tem de ser IGUAL ao treino
 }
 
 def load_models():

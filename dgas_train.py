@@ -18,8 +18,8 @@ CONFIG = {
     "STEPS": 1000000,
     "WARMUP_STEPS": 5000, 
     "N_FFT": 2048, "HOP_LENGTH": 512,
-    "LAMBDA_FLOW": 10.0,
-    "LAMBDA_MRSTFT": 5.0, # Reduzido ligeiramente para equilibrar
+    "LAMBDA_FLOW": 100.0,
+    "LAMBDA_MRSTFT": 0.05, # Reduzido ligeiramente para equilibrar
     "LAMBDA_ADV": 0.05,   
     "LAMBDA_R1": 10.0,   
     "R1_INTERVAL": 16,    
@@ -68,8 +68,7 @@ def gpu_stft(audio):
     spec = jnp.stack([Zxx.real, Zxx.imag], axis=-1)
     B, C, F, T, _ = spec.shape
     spec = jnp.transpose(spec, (0, 1, 4, 2, 3)).reshape(B, C * 2, F, T)
-    # Mantemos o Boost HARDCODED x50.0 como querias
-    return spec * 50.0
+    return spec * 5
 
 def diff_spec_augment(x, key, strength):
     B, C, F, T = x.shape

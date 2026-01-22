@@ -10,7 +10,7 @@ from dgas_model import Generator, Discriminator
 jax.config.update("jax_platform_name", "gpu")
 CHECKPOINT = "checkpoints/dgas_latest.eqx"
 FILE_PATH = "mixture.wav"
-SIGNAL_SCALE = 50.0  # <--- OBRIGATÓRIO PARA VALIDAR O NOVO TREINO
+SIGNAL_SCALE = 5.0  # <--- OBRIGATÓRIO PARA VALIDAR O NOVO TREINO
 
 def analyze_tensor(name, tensor):
     data = np.array(tensor)

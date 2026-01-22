@@ -108,7 +108,7 @@ class DGASField(eqx.Module):
         
         # --- CORREÇÃO 1: DIVISÃO POR 50.0 ---
         # Crucial para o Boost não saturar a rede
-        val_emb = self.val_proj(x_val / 50.0)
+        val_emb = self.val_proj(x_val) 
         
         grid_feats = [g(x_pos) for g in self.grids]
         
