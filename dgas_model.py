@@ -3,7 +3,7 @@ import jax.numpy as jnp
 import equinox as eqx
 from typing import List
 
-# --- UTILS ---
+# --- UTILS & INTERPOLAÇÃO ---
 def smoother_step(x):
     x = jnp.clip(x, 0.0, 1.0)
     return x * x * x * (x * (x * 6 - 15) + 10)
@@ -13,6 +13,39 @@ def siren_init(weight: jnp.ndarray, key, w0=1.0):
     limit = jnp.sqrt(6 / in_dim) / w0
     return jax.random.uniform(key, (out_dim, in_dim), minval=-limit, maxval=limit)
 
+def sample_grid(grid, coords):
+    """
+    Realiza amostragem bilinear na grelha latente.
+    grid: [Channels, Freq(H), Time(W)]
+    coords: [2] (t, f) normalizados entre 0.0 e 1.0
+    """
+    C, H, W = grid.shape
+    
+    # coords[0] é Tempo (eixo W), coords[1] é Frequência (eixo H)
+    x = coords[0] * (W - 1)
+    y = coords[1] * (H - 1)
+    
+    x0 = jnp.floor(x).astype(int)
+    x1 = x0 + 1
+    y0 = jnp.floor(y).astype(int)
+    y1 = y0 + 1
+    
+    x0, x1 = jnp.clip(x0, 0, W-1), jnp.clip(x1, 0, W-1)
+    y0, y1 = jnp.clip(y0, 0, H-1), jnp.clip(y1, 0, H-1)
+    
+    wa = (x1 - x) * (y1 - y)
+    wb = (x1 - x) * (y - y0)
+    wc = (x - x0) * (y1 - y)
+    wd = (x - x0) * (y - y0)
+    
+    # grid[:, y, x] (C, H, W)
+    val = (grid[:, y0, x0] * wa + 
+           grid[:, y1, x0] * wb + 
+           grid[:, y0, x1] * wc + 
+           grid[:, y1, x1] * wd)
+    return val
+
+# --- MÓDULOS DE FIELD ---
 class SinusoidalEmbedding(eqx.Module):
     frequencies: jnp.ndarray
     def __init__(self, embedding_dim: int, max_freq: float = 1000.0):
@@ -32,7 +65,8 @@ class ContinuousHashGrid(eqx.Module):
         self.grid_size = grid_size
         limit = jnp.sqrt(6 / output_dim)
         self.embeddings = jax.random.uniform(key, (grid_size, output_dim), minval=-limit, maxval=limit)
-
+        
+    @jax.checkpoint
     def __call__(self, x):
         x = jnp.clip(x, 0.0, 1.0)
         x_scaled = x * self.resolution
@@ -93,23 +127,29 @@ class DGASField(eqx.Module):
             FiLMLayer(keys[5], hidden_dim, hidden_dim),
             FiLMLayer(keys[6], hidden_dim, hidden_dim)
         ]
+        
+        # Projeta o cond local (128) para os parâmetros FiLM
         self.to_film = eqx.nn.Linear(latent_dim, 2 * 4 * hidden_dim, key=keys[7])
         self.final = eqx.nn.Linear(hidden_dim, 4, key=keys[8])
 
-    def __call__(self, t, x_pos, x_val, cond):
+    def __call__(self, t, x_pos, x_val, cond_grid):
         x_pos = jnp.clip(x_pos, 0.0, 1.0)
+        
+        # --- AMUSTRAGEM LOCAL (A GRANDE CORREÇÃO) ---
+        # Em vez de usar um vetor cond global, vamos buscar o cond local
+        # x_pos[0] = t (tempo), x_pos[1] = f (frequência)
+        local_cond = sample_grid(cond_grid, x_pos)
+        
         t_emb = self.time_embed(t)
         f_coord = x_pos[1] 
         f_emb = self.freq_embed(f_coord)
-        
-
         val_emb = self.val_proj(x_val) 
         
         grid_feats = [g(x_pos) for g in self.grids]
         
         h = jnp.concatenate(grid_feats + [x_pos, t_emb, f_emb, val_emb], axis=0)
         
-        film_params = self.to_film(cond).reshape(4, 2, self.hidden_dim)
+        film_params = self.to_film(local_cond).reshape(4, 2, self.hidden_dim)
         for i, layer in enumerate(self.layers):
             gamma, beta = film_params[i]
             h = layer(h, gamma, beta)
@@ -117,23 +157,28 @@ class DGASField(eqx.Module):
             
         return self.final(h)
 
-# --- NETWORKS (Inalterado) ---
+# --- NETWORKS ---
+
 class LatentEncoder(eqx.Module):
     layers: List[eqx.nn.Conv2d]
-    final: eqx.nn.Linear
+    # Removemos a camada final Linear para preservar a estrutura espacial
+
     def __init__(self, key, input_channels=4):
         keys = jax.random.split(key, 5)
         self.layers = [
-            eqx.nn.Conv2d(input_channels, 32, 3, stride=2, key=keys[0]),
-            eqx.nn.Conv2d(32, 64, 3, stride=2, key=keys[1]),
-            eqx.nn.Conv2d(64, 128, 3, stride=2, key=keys[2]),
-            eqx.nn.Conv2d(128, 128, 3, stride=2, key=keys[3]),
+            # Compressão espacial gradual, mas mantendo o mapa (H, W)
+            eqx.nn.Conv2d(input_channels, 32, 3, stride=2, padding=1, key=keys[0]), # /2
+            eqx.nn.Conv2d(32, 64, 3, stride=2, padding=1, key=keys[1]),  # /4
+            eqx.nn.Conv2d(64, 128, 3, stride=2, padding=1, key=keys[2]), # /8
+            eqx.nn.Conv2d(128, 128, 3, stride=1, padding=1, key=keys[3]), # Mantém resolução
         ]
-        self.final = eqx.nn.Linear(128, 128, key=keys[4])
+        
     def __call__(self, x):
-        for layer in self.layers: x = jax.nn.leaky_relu(layer(x))
-        x = jnp.mean(x, axis=(1, 2))
-        return self.final(x)
+        for layer in self.layers: 
+            x = jax.nn.leaky_relu(layer(x))
+        # REMOVIDO: jnp.mean(x, axis=(1, 2)) 
+        # Agora retorna o tensor [Channels, F_down, T_down]
+        return x
 
 class Discriminator(eqx.Module):
     layers: List[eqx.nn.Conv2d]
@@ -161,5 +206,5 @@ class Generator(eqx.Module):
         self.encoder = LatentEncoder(k1)
         self.field = DGASField(k2)
     def __call__(self, t, x_pos, x_val, mix_spec):
-        z = self.encoder(mix_spec)
-        return self.field(t, x_pos, x_val, z)
+        z_grid = self.encoder(mix_spec) # z agora é uma grelha
+        return self.field(t, x_pos, x_val, z_grid)

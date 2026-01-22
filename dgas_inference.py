@@ -11,7 +11,6 @@ from dgas_model import Generator, Discriminator
 jax.config.update("jax_platform_name", "gpu") 
 
 CONFIG = {
-    # Garante que aponta para o checkpoint do treino novo
     "CHECKPOINT": "checkpoints/dgas_latest.eqx", 
     "N_FFT": 2048,
     "HOP_LENGTH": 512,
@@ -19,8 +18,7 @@ CONFIG = {
     "OVERLAP": 0.5,
     "ODE_STEPS": 64, 
     "TARGET_SR": 44100,
-    # --- O SEGREDO DO SUCESSO ---
-    "SIGNAL_SCALE": 5.0  # Tem de ser IGUAL ao treino
+    "SIGNAL_SCALE": 5.0 
 }
 
 def load_models():
@@ -45,17 +43,12 @@ def cpu_stft_jax_impl(audio):
     spec = jnp.transpose(spec, (0, 1, 4, 2, 3))
     B, C, _, F, T = spec.shape
     spec = spec.reshape(B, C * 2, F, T)
-    
-
     return spec * CONFIG["SIGNAL_SCALE"]
 
 cpu_stft_jax = jax.jit(cpu_stft_jax_impl, backend='cpu')
 
-
 def cpu_istft_jax_impl(spec):
-
     spec = spec / CONFIG["SIGNAL_SCALE"]
-    
     B, _, F, T = spec.shape
     spec = spec.reshape(B, 2, 2, F, T)
     Zxx = spec[:, :, 0] + 1j * spec[:, :, 1]
@@ -80,12 +73,19 @@ def predict_spectrogram(model, mix_spec, key, steps):
     freqs, times = get_log_coords(F, T)
     grid_f, grid_t = jnp.meshgrid(freqs, times, indexing='ij')
     f_flat, t_flat = grid_f.flatten(), grid_t.flatten()
+    
     def get_velocity_single(t_curr, x_curr, cond_curr):
+        # Flatten para vmap
         x_flat = jnp.transpose(x_curr, (1, 2, 0)).reshape(-1, 4)
+        
+        # O field agora aceita cond_curr como Grelha (C, H, W)
+        # e faz sampling internamente usando [t_val, f]
         def field_point(f_val, t_val, x_val_i):
             return model.field(t_curr, jnp.array([t_val, f_val]), x_val_i, cond_curr)
+            
         v_flat = jax.vmap(field_point)(f_flat, t_flat, x_flat)
         return jnp.transpose(v_flat.reshape(F, T, 4), (2, 0, 1))
+        
     def loop_body(i, curr_x):
         t = i / steps
         d1 = jax.vmap(get_velocity_single, in_axes=(None, 0, 0))(t, curr_x, cond)
@@ -93,6 +93,7 @@ def predict_spectrogram(model, mix_spec, key, steps):
         d2 = jax.vmap(get_velocity_single, in_axes=(None, 0, 0))(t + dt, x_tilde, cond)
         curr_x = curr_x + (d1 + d2) * 0.5 * dt
         return curr_x
+        
     final_spec = jax.lax.fori_loop(0, steps, loop_body, x)
     return final_spec
 
@@ -124,13 +125,12 @@ def process_file(file_path, model):
         chunk = audio[:, i : i + chunk_samples]
         chunk_peak = np.max(np.abs(chunk))
         
-        
         if chunk_peak < 0.02:
             valid_len = min(chunk.shape[1], chunk_samples)
+            # Silêncio também deve ser "windowed" para evitar degraus de ruído de fundo
             weight_buffer[i : i + valid_len] += window[:valid_len]
             continue
             
-     
         scale_factor = 0.95 / chunk_peak
         chunk_norm = chunk * scale_factor
         
@@ -151,13 +151,16 @@ def process_file(file_path, model):
         rec_audio = rec_audio / scale_factor
         
         valid_len = min(rec_audio.shape[1], chunk_samples)
-        output_buffer[:, i : i + valid_len] += rec_audio[:, :valid_len]
+        
+        # --- CORREÇÃO OLA ---
+        # Aplicar janela ao áudio reconstruído ANTES de somar
+        output_buffer[:, i : i + valid_len] += rec_audio[:, :valid_len] * window[:valid_len]
         weight_buffer[i : i + valid_len] += window[:valid_len]
 
     weight_buffer[weight_buffer < 1e-8] = 1.0
     output_buffer /= weight_buffer
     
-    out_name = file_path.rsplit('.', 1)[0] + "_DGAS_BOOST.wav"
+    out_name = file_path.rsplit('.', 1)[0] + "_DGAS_BOOST_FIXED.wav"
     sf.write(out_name, output_buffer.T, sr)
     print(f"✅ Salvo: {out_name}")
 
