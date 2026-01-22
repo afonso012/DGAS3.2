@@ -58,31 +58,25 @@ def cpu_istft_jax_impl(spec):
 
 cpu_istft_jax = jax.jit(cpu_istft_jax_impl, backend='cpu')
 
-def get_log_coords(F, T):
-    times = jnp.linspace(0, 1, T)
-    linear_freqs = jnp.linspace(0, 1, F)
-    log_freqs = jnp.log1p(linear_freqs * 10.0) / jnp.log1p(10.0)
-    return log_freqs, times
-
 @eqx.filter_jit
 def predict_spectrogram(model, mix_spec, key, steps):
     cond = jax.vmap(model.encoder)(mix_spec) 
     x = jax.random.normal(key, mix_spec.shape)
     dt = 1.0 / steps
     B, C, F, T = mix_spec.shape
-    freqs, times = get_log_coords(F, T)
-    grid_f, grid_t = jnp.meshgrid(freqs, times, indexing='ij')
+    
+    # --- CORREÇÃO DE COORDENADAS ---
+    # Usar Linear Space na inferência também!
+    times = jnp.linspace(0, 1, T)
+    freqs_lin = jnp.linspace(0, 1, F)
+    
+    grid_f, grid_t = jnp.meshgrid(freqs_lin, times, indexing='ij')
     f_flat, t_flat = grid_f.flatten(), grid_t.flatten()
     
     def get_velocity_single(t_curr, x_curr, cond_curr):
-        # Flatten para vmap
         x_flat = jnp.transpose(x_curr, (1, 2, 0)).reshape(-1, 4)
-        
-        # O field agora aceita cond_curr como Grelha (C, H, W)
-        # e faz sampling internamente usando [t_val, f]
         def field_point(f_val, t_val, x_val_i):
             return model.field(t_curr, jnp.array([t_val, f_val]), x_val_i, cond_curr)
-            
         v_flat = jax.vmap(field_point)(f_flat, t_flat, x_flat)
         return jnp.transpose(v_flat.reshape(F, T, 4), (2, 0, 1))
         
@@ -127,7 +121,6 @@ def process_file(file_path, model):
         
         if chunk_peak < 0.02:
             valid_len = min(chunk.shape[1], chunk_samples)
-            # Silêncio também deve ser "windowed" para evitar degraus de ruído de fundo
             weight_buffer[i : i + valid_len] += window[:valid_len]
             continue
             
@@ -152,15 +145,13 @@ def process_file(file_path, model):
         
         valid_len = min(rec_audio.shape[1], chunk_samples)
         
-        # --- CORREÇÃO OLA ---
-        # Aplicar janela ao áudio reconstruído ANTES de somar
         output_buffer[:, i : i + valid_len] += rec_audio[:, :valid_len] * window[:valid_len]
         weight_buffer[i : i + valid_len] += window[:valid_len]
 
     weight_buffer[weight_buffer < 1e-8] = 1.0
     output_buffer /= weight_buffer
     
-    out_name = file_path.rsplit('.', 1)[0] + "_DGAS_BOOST_FIXED.wav"
+    out_name = file_path.rsplit('.', 1)[0] + "_DGAS_LINEAR_FIX.wav"
     sf.write(out_name, output_buffer.T, sr)
     print(f"✅ Salvo: {out_name}")
 

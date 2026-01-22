@@ -19,12 +19,14 @@ CONFIG = {
     "WARMUP_STEPS": 5000, 
     "N_FFT": 2048, "HOP_LENGTH": 512,
     "LAMBDA_FLOW": 100.0,
-    "LAMBDA_MRSTFT": 0.05, # Reduzido ligeiramente para equilibrar
+    "LAMBDA_MRSTFT": 0.05,
     "LAMBDA_ADV": 0.05,   
     "LAMBDA_R1": 10.0,   
     "R1_INTERVAL": 16,    
 }
 
+# (Mantemos esta função caso seja útil para visualização futura, 
+# mas NÃO a usamos mais para gerar coordenadas de treino)
 def get_log_coords(F, T):
     times = jnp.linspace(0, 1, T)
     linear_freqs = jnp.linspace(0, 1, F)
@@ -88,24 +90,26 @@ def compute_disc_loss(discriminator, generator, mix_spec, target_spec, key, do_r
     x0 = jax.random.normal(k_noise, target_spec.shape)
     t_b = t[:, None, None, None]
     x_t = t_b * target_spec + (1.0 - t_b) * x0
-    freqs, times = get_log_coords(F, T)
-    grid_f, grid_t = jnp.meshgrid(freqs, times, indexing='ij')
+    
+    # --- CORREÇÃO DE COORDENADAS ---
+    # Usar Linear Space para alinhar com a grelha latente (que é linear)
+    times = jnp.linspace(0, 1, T)
+    freqs_lin = jnp.linspace(0, 1, F) 
+    
+    grid_f, grid_t = jnp.meshgrid(freqs_lin, times, indexing='ij')
     ff, tt = grid_f.flatten(), grid_t.flatten()
     
     def predict_batch_sample(ti, xti, zi):
         xti_flat = xti.reshape(4, -1).T
-        # Correção no gerador: xti já está escalado, mas o modelo agora lida com isso
         v = jax.vmap(lambda f, t_val, x_val: generator.field(ti, jnp.array([t_val, f]), x_val, zi))(ff, tt, xti_flat)
         return v.T.reshape(4, F, T)
     
     v_pred = jax.vmap(predict_batch_sample)(t, x_t, z)
     
-    # CORREÇÃO CRÍTICA: O Discriminador deve ver o X1 estimado, não o target puro ou v_pred
-    # x1_pred = x_t + (1-t) * v_pred
     x1_pred = x_t + (1.0 - t_b) * v_pred
     
     target_aug = diff_spec_augment(target_spec, k_aug, aug_strength)
-    fake_aug = diff_spec_augment(x1_pred, k_aug, aug_strength) # Discrimina o audio reconstruído
+    fake_aug = diff_spec_augment(x1_pred, k_aug, aug_strength) 
     
     real_scores = jax.vmap(discriminator)(target_aug, mix_spec)
     fake_scores = jax.vmap(discriminator)(fake_aug, mix_spec)
@@ -130,8 +134,12 @@ def compute_gen_loss(generator, discriminator, mix_spec, target_spec, key, step,
     x_t = t_b * target_spec + (1.0 - t_b) * x0
     v_target = target_spec - x0
     
-    freqs, times = get_log_coords(F, T)
-    grid_f, grid_t = jnp.meshgrid(freqs, times, indexing='ij')
+    # --- CORREÇÃO DE COORDENADAS ---
+    # Obrigatório: Coordenadas lineares para o sample_grid funcionar
+    times = jnp.linspace(0, 1, T)
+    freqs_lin = jnp.linspace(0, 1, F)
+    
+    grid_f, grid_t = jnp.meshgrid(freqs_lin, times, indexing='ij')
     ff, tt = grid_f.flatten(), grid_t.flatten()
     
     def predict_batch_sample(ti, xti, zi):
@@ -141,23 +149,17 @@ def compute_gen_loss(generator, discriminator, mix_spec, target_spec, key, step,
         
     v_pred = jax.vmap(predict_batch_sample)(t, x_t, z)
     
-    # 1. Flow Loss (MSE no vetor) - Mantém a física correta
     flow_loss = jnp.mean((v_pred - v_target)**2)
     
-    # 2. MRSTFT Loss - CORRIGIDA
-    # Calculamos a perda no "Audio Limpo Estimado" (x1_pred) e não na velocidade
-    # x1 = x_t + (1-t)v
     x1_pred = x_t + (1.0 - t_b) * v_pred
     mrstft_loss = compute_mrstft_loss(x1_pred, target_spec)
     
-    # 3. Phase Loss (Cosseno)
     dot = jnp.sum(v_pred * v_target, axis=1)
     norm_p = jnp.linalg.norm(v_pred, axis=1) + 1e-6
     norm_t = jnp.linalg.norm(v_target, axis=1) + 1e-6
     raw_phase_loss = jnp.mean(1.0 - (dot / (norm_p * norm_t)))
     phase_weight = jnp.clip(step / 10000.0, 0.0, 1.0) * 1.0 
     
-    # 4. Adversarial Loss (No audio reconstruido)
     fake_aug = diff_spec_augment(x1_pred, k_aug, aug_strength)
     fake_score = jax.vmap(discriminator)(fake_aug, mix_spec)
     adv_loss = -jnp.mean(fake_score)
@@ -171,9 +173,6 @@ def train_step(gen, disc, opt_gen, opt_disc, optim_gen, optim_disc, mix_wav, tar
     mix_spec = gpu_stft(mix_wav)
     target_spec = gpu_stft(target_wav)
     
-    # Opcional: Debug print para garantir que o boost está lá
-    # jax.debug.print("Target Max: {}", jnp.max(jnp.abs(target_spec)))
-
     k1, k2, k_aug = jax.random.split(key, 3)
     do_r1 = (step % CONFIG["R1_INTERVAL"] == 0)
     pid_int, aug_strength = pid_state
@@ -204,7 +203,7 @@ def train_step(gen, disc, opt_gen, opt_disc, optim_gen, optim_disc, mix_wav, tar
     return new_gen, new_disc, new_opt_gen, new_opt_disc, g_loss, d_loss, r1_val, gen_metrics, (new_int, new_aug)
 
 def main():
-    print(f"=== DGAS 3.6.8: FIXED LOSS & SCALED FIELD ===")
+    print(f"=== DGAS 3.6.9: LINEAR COORDS FIX ===")
     
     if os.path.exists(CONFIG['CHECKPOINT_DIR']): 
         shutil.rmtree(CONFIG['CHECKPOINT_DIR'])
@@ -215,7 +214,6 @@ def main():
     gen = Generator(key=k_gen)
     disc = Discriminator(key=k_disc)
     
-    # Cosine decay restart se for muito longo
     lr = optax.warmup_cosine_decay_schedule(1e-5, 3e-4, 2000, CONFIG["STEPS"], 1e-6)
     optim = optax.chain(optax.clip_by_global_norm(1.0), optax.adamw(lr, b1=0.5, b2=0.9, weight_decay=1e-4))
     
