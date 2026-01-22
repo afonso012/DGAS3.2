@@ -21,10 +21,7 @@ def analyze_tensor(name, tensor):
     # Análise de Magnitude para o Boost
     if "Spectrogram" in name:
         peak = np.max(np.abs(data))
-        if peak < 1.0:
-            print(f"   ⚠️  ALERTA: Sinal muito fraco ({peak:.4f}). O Boost não está a funcionar!")
-        elif peak > 5.0:
-            print(f"   ✅ SUCESSO: Sinal forte detetado ({peak:.4f}). O Boost está ativo.")
+
 
 def main():
     print(f"=== DGAS DIAGNOSTIC TOOL (Boost x{SIGNAL_SCALE}) ===")
@@ -85,11 +82,8 @@ def main():
         cond = gen.encoder(spec_boosted[0])
         analyze_tensor("Encoder Output", cond)
         
-        # O encoder deve reagir com valores fortes se o input for forte
-        if np.std(np.array(cond)) < 0.01:
-             print("   ⚠️  AVISO: O Encoder parece 'adormecido' (Std baixo). Pode precisar de mais treino.")
-        else:
-             print("   ✅ O Encoder está a reagir bem ao sinal boostado.")
+
+        
 
     print("\n=== FIM DO DIAGNÓSTICO ===")
 

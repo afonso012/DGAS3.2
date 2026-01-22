@@ -8,8 +8,6 @@ def smoother_step(x):
     x = jnp.clip(x, 0.0, 1.0)
     return x * x * x * (x * (x * 6 - 15) + 10)
 
-# Mantemos a init do Siren só para a primeira camada linear se necessário, 
-# mas usamos w0=1.0 por segurança.
 def siren_init(weight: jnp.ndarray, key, w0=1.0):
     out_dim, in_dim = weight.shape
     limit = jnp.sqrt(6 / in_dim) / w0
@@ -56,7 +54,6 @@ class FiLMLayer(eqx.Module):
     linear: eqx.nn.Linear
     def __init__(self, key, in_dim, out_dim):
         self.linear = eqx.nn.Linear(in_dim, out_dim, use_bias=True, key=key)
-        # Inicialização Xavier (Melhor para Swish)
         w_init = jax.nn.initializers.xavier_uniform()(key, (out_dim, in_dim))
         self.linear = eqx.tree_at(lambda l: l.weight, self.linear, w_init)
 
@@ -98,7 +95,6 @@ class DGASField(eqx.Module):
         ]
         self.to_film = eqx.nn.Linear(latent_dim, 2 * 4 * hidden_dim, key=keys[7])
         self.final = eqx.nn.Linear(hidden_dim, 4, key=keys[8])
-        # Sem multiplicação por 0.01 na saída!
 
     def __call__(self, t, x_pos, x_val, cond):
         x_pos = jnp.clip(x_pos, 0.0, 1.0)
@@ -106,8 +102,7 @@ class DGASField(eqx.Module):
         f_coord = x_pos[1] 
         f_emb = self.freq_embed(f_coord)
         
-        # --- CORREÇÃO 1: DIVISÃO POR 50.0 ---
-        # Crucial para o Boost não saturar a rede
+
         val_emb = self.val_proj(x_val) 
         
         grid_feats = [g(x_pos) for g in self.grids]
@@ -118,9 +113,6 @@ class DGASField(eqx.Module):
         for i, layer in enumerate(self.layers):
             gamma, beta = film_params[i]
             h = layer(h, gamma, beta)
-            
-            # --- CORREÇÃO 2: SWISH ---
-            # Removemos o jnp.sin(30.0 * h) que causava o ruído
             h = jax.nn.swish(h) 
             
         return self.final(h)

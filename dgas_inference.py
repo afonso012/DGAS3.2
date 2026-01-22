@@ -46,14 +46,14 @@ def cpu_stft_jax_impl(audio):
     B, C, _, F, T = spec.shape
     spec = spec.reshape(B, C * 2, F, T)
     
-    # APLICAR O BOOST (CRÍTICO)
+
     return spec * CONFIG["SIGNAL_SCALE"]
 
 cpu_stft_jax = jax.jit(cpu_stft_jax_impl, backend='cpu')
 
-# ISTFT com DE-BOOST
+
 def cpu_istft_jax_impl(spec):
-    # REMOVER O BOOST ANTES DE CONVERTER PARA AUDIO
+
     spec = spec / CONFIG["SIGNAL_SCALE"]
     
     B, _, F, T = spec.shape
@@ -124,18 +124,18 @@ def process_file(file_path, model):
         chunk = audio[:, i : i + chunk_samples]
         chunk_peak = np.max(np.abs(chunk))
         
-        # Filtro de Silêncio
+        
         if chunk_peak < 0.02:
             valid_len = min(chunk.shape[1], chunk_samples)
             weight_buffer[i : i + valid_len] += window[:valid_len]
             continue
             
-        # Normalização para 0.95
+     
         scale_factor = 0.95 / chunk_peak
         chunk_norm = chunk * scale_factor
         
         chunk_jax = jnp.array(chunk_norm)[None, ...]
-        spec_jax = cpu_stft_jax(chunk_jax) # Já aplica Boost aqui!
+        spec_jax = cpu_stft_jax(chunk_jax) 
         
         if gpu_dev: spec_gpu = jax.device_put(spec_jax, gpu_dev)
         else: spec_gpu = spec_jax
@@ -145,10 +145,9 @@ def process_file(file_path, model):
         
         if cpu_dev: rec_spec_cpu = jax.device_put(rec_spec_gpu, cpu_dev)
         else: rec_spec_cpu = rec_spec_gpu
-        rec_audio_jax = cpu_istft_jax(rec_spec_cpu) # Já remove Boost aqui!
+        rec_audio_jax = cpu_istft_jax(rec_spec_cpu)
         rec_audio = np.array(rec_audio_jax[0])
-        
-        # Desnormalização
+
         rec_audio = rec_audio / scale_factor
         
         valid_len = min(rec_audio.shape[1], chunk_samples)
