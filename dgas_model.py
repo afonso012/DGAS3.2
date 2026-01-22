@@ -8,7 +8,9 @@ def smoother_step(x):
     x = jnp.clip(x, 0.0, 1.0)
     return x * x * x * (x * (x * 6 - 15) + 10)
 
-def siren_init(weight: jnp.ndarray, key, w0=30.0):
+# Mantemos a init do Siren só para a primeira camada linear se necessário, 
+# mas usamos w0=1.0 por segurança.
+def siren_init(weight: jnp.ndarray, key, w0=1.0):
     out_dim, in_dim = weight.shape
     limit = jnp.sqrt(6 / in_dim) / w0
     return jax.random.uniform(key, (out_dim, in_dim), minval=-limit, maxval=limit)
@@ -22,7 +24,6 @@ class SinusoidalEmbedding(eqx.Module):
         args = x * self.frequencies
         return jnp.concatenate([jnp.sin(args), jnp.cos(args)])
 
-# --- HASH GRID & LAYERS ---
 class ContinuousHashGrid(eqx.Module):
     embeddings: jnp.ndarray
     resolution: int
@@ -35,19 +36,14 @@ class ContinuousHashGrid(eqx.Module):
         self.embeddings = jax.random.uniform(key, (grid_size, output_dim), minval=-limit, maxval=limit)
 
     def __call__(self, x):
-        # CORREÇÃO B: CLIP OBRIGATÓRIO
-        # Impede que coordenadas <0 ou >1 causem wrap-around no hash
         x = jnp.clip(x, 0.0, 1.0)
-        
         x_scaled = x * self.resolution
         x0 = jnp.floor(x_scaled).astype(jnp.int32)
         x1 = x0 + 1
         weights = smoother_step(x_scaled - x0)
         primes = jnp.array([1, 2654435761], dtype=jnp.uint32) 
-        
         def get_hash(coords):
             return jnp.sum(coords * primes[:coords.shape[0]], axis=0) % self.grid_size
-
         idx00, idx01 = get_hash(x0), get_hash(jnp.array([x0[0], x1[1]]))
         idx10, idx11 = get_hash(jnp.array([x1[0], x0[1]])), get_hash(x1)
         v00, v01 = self.embeddings[idx00], self.embeddings[idx01]
@@ -60,8 +56,10 @@ class FiLMLayer(eqx.Module):
     linear: eqx.nn.Linear
     def __init__(self, key, in_dim, out_dim):
         self.linear = eqx.nn.Linear(in_dim, out_dim, use_bias=True, key=key)
-        w_init = siren_init(self.linear.weight, key)
+        # Inicialização Xavier (Melhor para Swish)
+        w_init = jax.nn.initializers.xavier_uniform()(key, (out_dim, in_dim))
         self.linear = eqx.tree_at(lambda l: l.weight, self.linear, w_init)
+
     def __call__(self, x, gamma, beta):
         out = self.linear(x)
         return (1.0 + gamma) * out + beta
@@ -100,16 +98,17 @@ class DGASField(eqx.Module):
         ]
         self.to_film = eqx.nn.Linear(latent_dim, 2 * 4 * hidden_dim, key=keys[7])
         self.final = eqx.nn.Linear(hidden_dim, 4, key=keys[8])
-        self.final = eqx.tree_at(lambda l: l.weight, self.final, self.final.weight * 0.01)
+        # Sem multiplicação por 0.01 na saída!
 
     def __call__(self, t, x_pos, x_val, cond):
-        # Clip adicional por segurança
         x_pos = jnp.clip(x_pos, 0.0, 1.0)
-        
         t_emb = self.time_embed(t)
         f_coord = x_pos[1] 
         f_emb = self.freq_embed(f_coord)
-        val_emb = self.val_proj(x_val)
+        
+        # --- CORREÇÃO 1: DIVISÃO POR 50.0 ---
+        # Crucial para o Boost não saturar a rede
+        val_emb = self.val_proj(x_val / 50.0)
         
         grid_feats = [g(x_pos) for g in self.grids]
         
@@ -119,7 +118,11 @@ class DGASField(eqx.Module):
         for i, layer in enumerate(self.layers):
             gamma, beta = film_params[i]
             h = layer(h, gamma, beta)
-            h = jnp.sin(30.0 * h) 
+            
+            # --- CORREÇÃO 2: SWISH ---
+            # Removemos o jnp.sin(30.0 * h) que causava o ruído
+            h = jax.nn.swish(h) 
+            
         return self.final(h)
 
 # --- NETWORKS (Inalterado) ---

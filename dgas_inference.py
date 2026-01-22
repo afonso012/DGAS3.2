@@ -17,7 +17,7 @@ CONFIG = {
     "HOP_LENGTH": 512,
     "CHUNK_SIZE": 1.5,
     "OVERLAP": 0.5,
-    "ODE_STEPS": 32, 
+    "ODE_STEPS": 64, 
     "TARGET_SR": 44100,
     # --- O SEGREDO DO SUCESSO ---
     "SIGNAL_SCALE": 50.0  # Tem de ser IGUAL ao treino
@@ -152,7 +152,7 @@ def process_file(file_path, model):
         rec_audio = rec_audio / scale_factor
         
         valid_len = min(rec_audio.shape[1], chunk_samples)
-        output_buffer[:, i : i + valid_len] += rec_audio[:, :valid_len] * window[:valid_len]
+        output_buffer[:, i : i + valid_len] += rec_audio[:, :valid_len]
         weight_buffer[i : i + valid_len] += window[:valid_len]
 
     weight_buffer[weight_buffer < 1e-8] = 1.0
