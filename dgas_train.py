@@ -70,7 +70,7 @@ def gpu_stft(audio):
     spec = jnp.stack([Zxx.real, Zxx.imag], axis=-1)
     B, C, F, T, _ = spec.shape
     spec = jnp.transpose(spec, (0, 1, 4, 2, 3)).reshape(B, C * 2, F, T)
-    return spec * 5
+    return spec 
 
 def diff_spec_augment(x, key, strength):
     B, C, F, T = x.shape

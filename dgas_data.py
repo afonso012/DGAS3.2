@@ -40,11 +40,7 @@ class AudioLoader:
         if max_mix < 0.05: 
             return None, None
             
-        # 2. CRÍTICO: Se o vocal for silêncio, ignorar para este treino.
-        # Se treinarmos com silêncio, o modelo aprende a gerar silêncio (ou v=0).
-        if max_vox < 0.01:
-            return None, None
-        
+
         scale = 0.95 / (max_mix + 1e-8)
         return mix * scale, vox * scale
 

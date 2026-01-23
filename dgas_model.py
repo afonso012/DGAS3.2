@@ -75,7 +75,11 @@ class ContinuousHashGrid(eqx.Module):
         weights = smoother_step(x_scaled - x0)
         primes = jnp.array([1, 2654435761], dtype=jnp.uint32) 
         def get_hash(coords):
-            return jnp.sum(coords * primes[:coords.shape[0]], axis=0) % self.grid_size
+            # coords: [2]
+            p = coords * primes[:coords.shape[0]]
+            # XOR bitwise entre as coordenadas
+            h = jax.lax.bitwise_xor(p[0], p[1])
+            return h % self.grid_si
         idx00, idx01 = get_hash(x0), get_hash(jnp.array([x0[0], x1[1]]))
         idx10, idx11 = get_hash(jnp.array([x1[0], x0[1]])), get_hash(x1)
         v00, v01 = self.embeddings[idx00], self.embeddings[idx01]

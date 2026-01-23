@@ -18,7 +18,7 @@ CONFIG = {
     "OVERLAP": 0.5,
     "ODE_STEPS": 64, 
     "TARGET_SR": 44100,
-    "SIGNAL_SCALE": 5.0 
+    "SIGNAL_SCALE": 1.0 
 }
 
 def load_models():
@@ -124,7 +124,9 @@ def process_file(file_path, model):
             weight_buffer[i : i + valid_len] += window[:valid_len]
             continue
             
-        scale_factor = 0.95 / chunk_peak
+        MAX_GAIN = 10.0
+        target_gain = 0.95 / (chunk_peak + 1e-6)
+        scale_factor = min(target_gain, MAX_GAIN)
         chunk_norm = chunk * scale_factor
         
         chunk_jax = jnp.array(chunk_norm)[None, ...]
