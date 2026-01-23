@@ -18,7 +18,7 @@ CONFIG = {
     "OVERLAP": 0.5,
     "ODE_STEPS": 64, 
     "TARGET_SR": 44100,
-    "SIGNAL_SCALE": 1.0 
+    "SIGNAL_SCALE": 50.0 
 }
 
 def load_models():
