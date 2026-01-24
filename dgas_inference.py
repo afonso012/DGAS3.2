@@ -76,9 +76,10 @@ def stft_log_preprocess(audio):
     
     mag = jnp.abs(Zxx)
     phase = jnp.angle(Zxx)
-    mag_log = jnp.log1p(mag * 1000.0) * 0.1
+
+    mag_pow = mag ** 0.3
     
-    spec = jnp.stack([mag_log * jnp.cos(phase), mag_log * jnp.sin(phase)], axis=-1)
+    spec = jnp.stack([mag_pow * jnp.cos(phase), mag_pow * jnp.sin(phase)], axis=-1)
     spec = jnp.transpose(spec, (0, 1, 4, 2, 3)).reshape(B, C * 2, F, T_spec)
     return spec
 
@@ -94,13 +95,9 @@ def istft_log_postprocess(spec):
         mag = jnp.sqrt(re**2 + im**2)
         phase = jnp.arctan2(im, re)
         
-        # --- A CORREÇÃO MÁGICA ---
-        # Tal como no treino, impedimos a rede de prever > 1.0
-        # Isto evita que o expm1 dispare para 22.0 (clipping)
-        limit = 0.7
-        mag = limit * jnp.tanh(mag / limit) # Substitui o jnp.clip
+        # Power Expansion (Sem Clamps!)
+        mag_linear = mag ** (1.0 / 0.3)
         
-        mag_linear = jnp.expm1(mag * 10.0) / 1000.0
         return mag_linear * jnp.exp(1j * phase)
 
     Z_l = recover_complex(l_re, l_im)

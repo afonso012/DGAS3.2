@@ -45,38 +45,26 @@ def get_log_coords(B, F, T):
 
 # --- 2. DIFERENCIÁVEIS (ISTFT & Augment) ---
 def diff_istft(spec):
-    """
-    Reconstrução diferenciável com SOFT SATURATION (Tanh).
-    Solução Inteligente: Mantém os gradientes vivos mesmo quando a rede erra.
-    """
     l_re, l_im = spec[:, 0], spec[:, 1]
     r_re, r_im = spec[:, 2], spec[:, 3]
     
     Z_l_raw = l_re + 1j * l_im
     Z_r_raw = r_re + 1j * r_im
     
-    def expand_safe(z):
+    def expand_power(z):
         mag = jnp.abs(z)
         phase = jnp.angle(z)
         
-        # --- A MELHORIA INTELIGENTE ---
-        # Em vez de cortar (clip) a 1.0, usamos tanh escalada.
-        # Isto comprime suavemente qualquer valor gigante para perto de 1.0,
-        # mas mantendo a informação do gradiente para corrigir a rede.
+        # Power Expansion (Inverso de mag ** 0.3)
+        # Removemos clamps e tanh porque a potência é estável
+        mag_linear = mag ** (1.0 / 0.3)
         
-        # Limite suave ~1.0 (Safe Zone para expm1)
-        # Se mag for 0.5 -> 0.46 (Linear, quase igual)
-        # Se mag for 2.0 -> 0.96 (Comprimido, mas com gradiente!)
-        # Se mag for 100 -> 1.00 (Seguro, sem explosão)
-        limit = 1.0
-        mag_soft = limit * jnp.tanh(mag / limit)
-        
-        mag_linear = jnp.expm1(mag_soft * 10.0) / 1000.0 
         return mag_linear * jnp.exp(1j * phase)
 
-    Z_l = expand_safe(Z_l_raw)
-    Z_r = expand_safe(Z_r_raw)
-
+    Z_l = expand_power(Z_l_raw)
+    Z_r = expand_power(Z_r_raw)
+    
+    # ... (o resto da função mantém-se igual: windowing e istft) ...
     window = jnp.hanning(CONFIG["N_FFT"])
     def single_istft(z):
         return jax.scipy.signal.istft(z, fs=44100, window=window, 
@@ -85,10 +73,8 @@ def diff_istft(spec):
     
     wav_l = jax.vmap(single_istft)(Z_l)
     wav_r = jax.vmap(single_istft)(Z_r)
-    
     wav_l = wav_l[:, :CONFIG["CHUNK_SIZE"]]
     wav_r = wav_r[:, :CONFIG["CHUNK_SIZE"]]
-    
     return jnp.stack([wav_l, wav_r], axis=1)
 
 def diff_spec_augment(x, key, strength):
@@ -247,18 +233,21 @@ def compute_gen_loss(generator, discriminator, mix_spec, target_spec, wav_target
 @eqx.filter_jit
 def train_step(gen, gen_ema, disc, opt_gen, opt_disc, optim_gen, optim_disc, mix_wav, target_wav, key, step, pid_state):
     # STFT Log-Aware (Input Prep)
-    def gpu_stft_log(audio):
+    def gpu_stft_power(audio):
         window = jnp.hanning(CONFIG["N_FFT"])
         f, t, Zxx = jax.scipy.signal.stft(audio, fs=44100, window=window, nperseg=CONFIG["N_FFT"], noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"])
         mag = jnp.abs(Zxx)
         phase = jnp.angle(Zxx)
-        mag = jnp.log1p(mag * 1000.0) * 0.1
+        
+        # Power Compression (Estável)
+        mag = mag ** 0.3
+        
         spec = jnp.stack([mag * jnp.cos(phase), mag * jnp.sin(phase)], axis=-1)
         B, C, F, T, _ = spec.shape
         return jnp.transpose(spec, (0, 1, 4, 2, 3)).reshape(B, C * 2, F, T)
 
-    mix_spec = gpu_stft_log(mix_wav)
-    target_spec = gpu_stft_log(target_wav)
+    mix_spec = gpu_stft_power(mix_wav)
+    target_spec = gpu_stft_power(target_wav)
     
     k1, k2, k_aug = jax.random.split(key, 3)
     do_r1 = (step % CONFIG["R1_INTERVAL"] == 0)
