@@ -37,10 +37,7 @@ def sample_grid_multiscale(grid, coords):
 # ==============================================================================
 
 class ResBlock(eqx.Module):
-    """
-    Bloco Residual com Dilatação.
-    Aumenta o campo receptivo e estabiliza o gradiente em redes profundas.
-    """
+    """Bloco Residual com Dilatação."""
     conv1: eqx.nn.Conv2d
     conv2: eqx.nn.Conv2d
     norm1: eqx.nn.GroupNorm
@@ -48,10 +45,9 @@ class ResBlock(eqx.Module):
     
     def __init__(self, channels, dilation=1, key=None):
         k1, k2 = jax.random.split(key)
-        # Padding deve compensar a dilatação para manter o tamanho: dilation * (kernel-1) / 2
         pad = dilation
         self.conv1 = eqx.nn.Conv2d(channels, channels, 3, padding=pad, dilation=dilation, key=k1)
-        self.conv2 = eqx.nn.Conv2d(channels, channels, 3, padding=1, key=k2) # Segunda conv padrão
+        self.conv2 = eqx.nn.Conv2d(channels, channels, 3, padding=1, key=k2)
         self.norm1 = eqx.nn.GroupNorm(min(32, channels // 4), channels)
         self.norm2 = eqx.nn.GroupNorm(min(32, channels // 4), channels)
         
@@ -62,27 +58,16 @@ class ResBlock(eqx.Module):
         h = self.norm2(h)
         h = jax.nn.swish(h)
         h = self.conv2(h)
-        return x + h # Residual Connection
+        return x + h 
 
 def add_coord_channels(x):
-    """
-    Implementação CoordConv.
-    Adiciona canais de coordenadas normalizadas (y, x) ao tensor de entrada.
-    x: [C, H, W] -> Output: [C+2, H, W]
-    """
+    """Implementação CoordConv."""
     C, H, W = x.shape
-    
-    # Grid Y (Frequência) - Varia de 0 a 1 verticalmente
     y_coords = jnp.linspace(0, 1, H)
-    y_grid = jnp.tile(y_coords[:, None], (1, W)) # [H, W]
-    
-    # Grid X (Tempo) - Varia de 0 a 1 horizontalmente
+    y_grid = jnp.tile(y_coords[:, None], (1, W))
     x_coords = jnp.linspace(0, 1, W)
-    x_grid = jnp.tile(x_coords[None, :], (H, 1)) # [H, W]
-    
-    # Expand dims para concatenar: [1, H, W]
+    x_grid = jnp.tile(x_coords[None, :], (H, 1))
     coords = jnp.stack([y_grid, x_grid], axis=0)
-    
     return jnp.concatenate([x, coords], axis=0)
 
 # ==============================================================================
@@ -92,6 +77,7 @@ def add_coord_channels(x):
 class SinusoidalEmbedding(eqx.Module):
     frequencies: jnp.ndarray
     def __init__(self, embedding_dim: int, min_freq=1.0, max_freq=1000.0):
+        # Gera embedding_dim frequências no total (sin + cos)
         half_dim = embedding_dim // 2
         self.frequencies = jnp.exp(jnp.linspace(jnp.log(min_freq), jnp.log(max_freq), half_dim))
     def __call__(self, x):
@@ -142,15 +128,14 @@ class FiLMLayer(eqx.Module):
 # ==============================================================================
 
 class MultiScaleEncoder(eqx.Module):
-    """
-    Encoder SOTA:
-    1. Usa CoordConv (sabe onde está na frequência).
-    2. Usa ResBlocks (aprende identidades profundas).
-    3. Usa Dilatação (vê contextos temporais longos).
-    """
+    """Encoder SOTA corrigido para evitar FrozenInstanceError."""
+    # Declaração explícita de campos (Obrigatório no Equinox)
     init_conv: eqx.nn.Conv2d
-    blocks: List[ResBlock]
-    downsamples: List[eqx.nn.Conv2d]
+    blocks_l0: List[ResBlock]
+    down0: eqx.nn.Conv2d
+    blocks_l1: List[ResBlock]
+    down1: eqx.nn.Conv2d
+    blocks_l2: List[ResBlock]
     
     def __init__(self, key):
         keys = jax.random.split(key, 10)
@@ -158,44 +143,40 @@ class MultiScaleEncoder(eqx.Module):
         # Input: 4 (Audio) + 2 (Coords) = 6 canais
         self.init_conv = eqx.nn.Conv2d(6, 32, kernel_size=3, padding=1, key=keys[0])
         
-        # Nível 0: Full Res (Dilatação progressiva 1, 2)
+        # Nível 0
         self.blocks_l0 = [
             ResBlock(32, dilation=1, key=keys[1]),
             ResBlock(32, dilation=2, key=keys[2])
         ]
         self.down0 = eqx.nn.Conv2d(32, 64, 3, stride=2, padding=1, key=keys[3])
         
-        # Nível 1: Half Res
+        # Nível 1
         self.blocks_l1 = [
             ResBlock(64, dilation=1, key=keys[4]),
             ResBlock(64, dilation=2, key=keys[5])
         ]
         self.down1 = eqx.nn.Conv2d(64, 128, 3, stride=2, padding=1, key=keys[6])
         
-        # Nível 2: Quarter Res
+        # Nível 2
         self.blocks_l2 = [
             ResBlock(128, dilation=1, key=keys[7]),
             ResBlock(128, dilation=2, key=keys[8])
         ]
 
     def __call__(self, x):
-        # 1. Injetar Coordenadas (CoordConv)
-        x = add_coord_channels(x) # [4, H, W] -> [6, H, W]
+        x = add_coord_channels(x) 
         
-        # Nível 0
         h = jax.nn.swish(self.init_conv(x))
         for block in self.blocks_l0: h = block(h)
-        f0 = h # Saída Fina
+        f0 = h 
         
-        # Nível 1
         h = jax.nn.swish(self.down0(h))
         for block in self.blocks_l1: h = block(h)
-        f1 = h # Saída Média
+        f1 = h 
         
-        # Nível 2
         h = jax.nn.swish(self.down1(h))
         for block in self.blocks_l2: h = block(h)
-        f2 = h # Saída Grossa
+        f2 = h 
         
         return f0, f1, f2
 
@@ -222,8 +203,17 @@ class DGASField(eqx.Module):
         self.freq_embed = SinusoidalEmbedding(32)
         self.val_proj = eqx.nn.Linear(4, 32, key=keys[2])
 
-        in_dim = 8 + 2 + 64 + 64 + 32
-        self.layers = [FiLMLayer(keys[i+3], in_dim, hidden_dim) for i in range(4)]
+        # CORREÇÃO CRÍTICA AQUI
+        in_dim = 8 + 2 + 32 + 32 + 32 # 106
+        
+        # Camada 1: 106 -> 256
+        layer1 = FiLMLayer(keys[3], in_dim, hidden_dim)
+        # Camadas seguintes: 256 -> 256
+        layer2 = FiLMLayer(keys[4], hidden_dim, hidden_dim)
+        layer3 = FiLMLayer(keys[5], hidden_dim, hidden_dim)
+        layer4 = FiLMLayer(keys[6], hidden_dim, hidden_dim)
+        
+        self.layers = [layer1, layer2, layer3, layer4]
         
         # Contexto: 32 (L0) + 64 (L1) + 128 (L2) = 224
         self.to_film = eqx.nn.Linear(224, 2 * 4 * hidden_dim, key=keys[7])
@@ -248,6 +238,7 @@ class DGASField(eqx.Module):
         grid_feats = [g(x_pos) for g in self.grids]
         
         h = jnp.concatenate(grid_feats + [x_pos, t_emb, f_emb, val_emb], axis=0)
+        
         film_params = self.to_film(local_cond).reshape(4, 2, -1)
         
         for i, layer in enumerate(self.layers):
@@ -258,14 +249,13 @@ class DGASField(eqx.Module):
         return self.final(h)
 
 class Discriminator(eqx.Module):
-    """Discriminador com ResBlocks para estabilidade adversarial."""
+    """Discriminador com ResBlocks."""
     init_conv: eqx.nn.Conv2d
-    blocks: List[ResBlock]
+    blocks: List[eqx.Module]
     final: eqx.nn.Linear
     
     def __init__(self, key):
         keys = jax.random.split(key, 8)
-        # Input: 8 canais (Target + Mix)
         self.init_conv = eqx.nn.Conv2d(8, 32, 4, stride=2, padding=1, key=keys[0])
         
         self.blocks = [
@@ -284,7 +274,7 @@ class Discriminator(eqx.Module):
         
         for layer in self.blocks:
             if isinstance(layer, ResBlock):
-                h = layer(h) # ResBlocks já têm ativação interna
+                h = layer(h)
             else:
                 h = layer(h)
                 h = jax.nn.leaky_relu(h, negative_slope=0.2)

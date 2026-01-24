@@ -45,21 +45,37 @@ def get_log_coords(B, F, T):
 
 # --- 2. DIFERENCIÁVEIS (ISTFT & Augment) ---
 def diff_istft(spec):
-    """Reconstrução diferenciável para cálculo de loss no tempo."""
+    """
+    Reconstrução diferenciável com SOFT SATURATION (Tanh).
+    Solução Inteligente: Mantém os gradientes vivos mesmo quando a rede erra.
+    """
     l_re, l_im = spec[:, 0], spec[:, 1]
     r_re, r_im = spec[:, 2], spec[:, 3]
-    Z_l = l_re + 1j * l_im
-    Z_r = r_re + 1j * r_im
     
-    # Expansão Log-Inversa (Assumindo que a rede prevê espaço log-comprimido)
-    def expand(z):
+    Z_l_raw = l_re + 1j * l_im
+    Z_r_raw = r_re + 1j * r_im
+    
+    def expand_safe(z):
         mag = jnp.abs(z)
         phase = jnp.angle(z)
-        mag_linear = jnp.expm1(mag * 10.0) / 1000.0 # Inverso aproximado da compressão
+        
+        # --- A MELHORIA INTELIGENTE ---
+        # Em vez de cortar (clip) a 1.0, usamos tanh escalada.
+        # Isto comprime suavemente qualquer valor gigante para perto de 1.0,
+        # mas mantendo a informação do gradiente para corrigir a rede.
+        
+        # Limite suave ~1.0 (Safe Zone para expm1)
+        # Se mag for 0.5 -> 0.46 (Linear, quase igual)
+        # Se mag for 2.0 -> 0.96 (Comprimido, mas com gradiente!)
+        # Se mag for 100 -> 1.00 (Seguro, sem explosão)
+        limit = 1.0
+        mag_soft = limit * jnp.tanh(mag / limit)
+        
+        mag_linear = jnp.expm1(mag_soft * 10.0) / 1000.0 
         return mag_linear * jnp.exp(1j * phase)
 
-    Z_l = expand(Z_l)
-    Z_r = expand(Z_r)
+    Z_l = expand_safe(Z_l_raw)
+    Z_r = expand_safe(Z_r_raw)
 
     window = jnp.hanning(CONFIG["N_FFT"])
     def single_istft(z):
@@ -69,8 +85,10 @@ def diff_istft(spec):
     
     wav_l = jax.vmap(single_istft)(Z_l)
     wav_r = jax.vmap(single_istft)(Z_r)
+    
     wav_l = wav_l[:, :CONFIG["CHUNK_SIZE"]]
     wav_r = wav_r[:, :CONFIG["CHUNK_SIZE"]]
+    
     return jnp.stack([wav_l, wav_r], axis=1)
 
 def diff_spec_augment(x, key, strength):
@@ -263,10 +281,9 @@ def train_step(gen, gen_ema, disc, opt_gen, opt_disc, optim_gen, optim_disc, mix
     updates_g, new_opt_gen = optim_gen.update(grads_g, opt_gen, gen)
     new_gen = eqx.apply_updates(gen, updates_g)
     
-    # --- EMA UPDATE (O Segredo da Estabilidade) ---
-    # gen_ema = decay * gen_ema + (1-decay) * new_gen
-    # Utilizamos tree_map para aplicar a todos os pesos
-    new_gen_ema = jax.tree_map(
+    # --- EMA UPDATE CORRIGIDO (JAX 0.6.0 COMPATIBLE) ---
+    # Substituímos jax.tree_map por jax.tree_util.tree_map
+    new_gen_ema = jax.tree_util.tree_map(
         lambda e, n: CONFIG["EMA_DECAY"] * e + (1.0 - CONFIG["EMA_DECAY"]) * n,
         gen_ema, new_gen
     )

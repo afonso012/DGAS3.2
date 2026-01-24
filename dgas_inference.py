@@ -10,7 +10,7 @@ from dgas_model import Generator, Discriminator
 
 # --- CONFIGURAÇÃO PRODUCTION (SOTA + TTA + Batching) ---
 CONFIG = {
-    "CHECKPOINT": "checkpoints/dgas_sota_ema.eqx", 
+    "CHECKPOINT": "checkpoints/dgas_latest.eqx",
     "CHUNK_SIZE": 65536, 
     "N_FFT": 2048,
     "HOP_LENGTH": 512,
@@ -18,9 +18,9 @@ CONFIG = {
     "OVERLAP": 0.25, 
     "TARGET_SR": 44100,
     
-    # NOVAS CONFIGURAÇÕES
-    "INFERENCE_BATCH_SIZE": 4, # Processa 4 chunks de 1.5s simultaneamente (Ajusta consoante a VRAM)
-    "USE_TTA": True,           # Test-Time Augmentation (Stereo Flip Average)
+    # Batch & TTA (Ajusta se tiveres pouca VRAM)
+    "INFERENCE_BATCH_SIZE": 4, 
+    "USE_TTA": True,
 }
 
 # ==============================================================================
@@ -31,7 +31,7 @@ def load_models():
     print(f"--- A Carregar Motor PRODUCTION: {CONFIG['CHECKPOINT']} ---")
     key = jax.random.PRNGKey(42)
     gen = Generator(key=key)
-    disc = Discriminator(key=key) # Dummy structure
+    disc = Discriminator(key=key) 
     
     if not os.path.exists(CONFIG['CHECKPOINT']):
         fallback = "checkpoints/dgas_latest.eqx"
@@ -51,17 +51,14 @@ def load_models():
     return gen
 
 # ==============================================================================
-# 2. ENGENHARIA DE SINAL (LOG-AWARE)
+# 2. ENGENHARIA DE SINAL (LOG-AWARE + SAFETY CLAMP)
 # ==============================================================================
 
 @jax.jit
 def stft_log_preprocess(audio):
     """Áudio -> Log Spectrogram (Batch Aware)"""
-    # audio shape: (Batch, Channels, Time)
-    
     window = jnp.hanning(CONFIG["N_FFT"])
     
-    # Função auxiliar para vmap sobre o batch
     def single_stft(a):
         f, t, Zxx = jax.scipy.signal.stft(
             a, fs=44100, window=window, 
@@ -70,14 +67,10 @@ def stft_log_preprocess(audio):
         )
         return Zxx
         
-    # Aplicar STFT canal a canal, batch a batch é complexo. 
-    # Melhor estratégia: Flatten Batch e Channels -> STFT -> Reshape
     B, C, T = audio.shape
     audio_flat = audio.reshape(B*C, T)
+    Zxx_flat = jax.vmap(single_stft)(audio_flat) 
     
-    Zxx_flat = jax.vmap(single_stft)(audio_flat) # (B*C, F, T_spec)
-    
-    # Reshape de volta
     _, F, T_spec = Zxx_flat.shape
     Zxx = Zxx_flat.reshape(B, C, F, T_spec)
     
@@ -86,15 +79,13 @@ def stft_log_preprocess(audio):
     mag_log = jnp.log1p(mag * 1000.0) * 0.1
     
     spec = jnp.stack([mag_log * jnp.cos(phase), mag_log * jnp.sin(phase)], axis=-1)
-    # (B, C, F, T, 2) -> (B, C*2, F, T)
     spec = jnp.transpose(spec, (0, 1, 4, 2, 3)).reshape(B, C * 2, F, T_spec)
     return spec
 
 @jax.jit
 def istft_log_postprocess(spec):
-    """Log Spectrogram -> Áudio (Batch Aware)"""
+    """Log Spectrogram -> Áudio (Batch Aware + Safety Clamp)"""
     B, C2, F, T = spec.shape
-    # C2 é 4 (L_re, L_im, R_re, R_im)
     
     l_re, l_im = spec[:, 0], spec[:, 1]
     r_re, r_im = spec[:, 2], spec[:, 3]
@@ -102,6 +93,13 @@ def istft_log_postprocess(spec):
     def recover_complex(re, im):
         mag = jnp.sqrt(re**2 + im**2)
         phase = jnp.arctan2(im, re)
+        
+        # --- A CORREÇÃO MÁGICA ---
+        # Tal como no treino, impedimos a rede de prever > 1.0
+        # Isto evita que o expm1 dispare para 22.0 (clipping)
+        limit = 0.7
+        mag = limit * jnp.tanh(mag / limit) # Substitui o jnp.clip
+        
         mag_linear = jnp.expm1(mag * 10.0) / 1000.0
         return mag_linear * jnp.exp(1j * phase)
 
@@ -114,15 +112,13 @@ def istft_log_postprocess(spec):
                                      nperseg=CONFIG["N_FFT"], 
                                      noverlap=CONFIG["N_FFT"] - CONFIG["HOP_LENGTH"])[1]
     
-    # Flatten para vmap
-    Z_concat = jnp.concatenate([Z_l, Z_r], axis=0) # (2*B, F, T)
+    Z_concat = jnp.concatenate([Z_l, Z_r], axis=0)
     wav_concat = jax.vmap(single_istft)(Z_concat)
     
-    # Split e Stack
     wav_l = wav_concat[:B]
     wav_r = wav_concat[B:]
     
-    return jnp.stack([wav_l, wav_r], axis=1) # (B, 2, T)
+    return jnp.stack([wav_l, wav_r], axis=1)
 
 # ==============================================================================
 # 3. SOLVER ODE & TTA
@@ -137,21 +133,14 @@ def get_log_coords(B, F, T):
 
 @eqx.filter_jit
 def predict_batch(model, mix_spec, key):
-    # mix_spec: (Batch, 4, F, T)
-    
-    # --- TTA LÓGICA (Dentro do JIT) ---
+    # TTA Logic
     if CONFIG["USE_TTA"]:
-        # Criar versão flipada dos canais: 
-        # [L_re, L_im, R_re, R_im] -> [R_re, R_im, L_re, L_im]
         mix_spec_flip = jnp.stack([mix_spec[:, 2], mix_spec[:, 3], mix_spec[:, 0], mix_spec[:, 1]], axis=1)
-        
-        # Concatenar no eixo Batch para paralelismo total
-        # Batch passa a ser 2x maior
         full_input = jnp.concatenate([mix_spec, mix_spec_flip], axis=0)
     else:
         full_input = mix_spec
 
-    # --- INFERÊNCIA ---
+    # Inference
     cond_grids = jax.vmap(model.encoder)(full_input)
     x = jax.random.normal(key, full_input.shape)
     
@@ -178,23 +167,18 @@ def predict_batch(model, mix_spec, key):
 
     final_spec = jax.lax.fori_loop(0, steps, loop_body, x)
     
-    # --- TTA MERGE ---
+    # TTA Merge
     if CONFIG["USE_TTA"]:
-        # Separar Normal e Flip
         B_orig = mix_spec.shape[0]
         res_normal = final_spec[:B_orig]
         res_flip = final_spec[B_orig:]
-        
-        # Des-flipar o resultado: [R, L] -> [L, R]
         res_flip_back = jnp.stack([res_flip[:, 2], res_flip[:, 3], res_flip[:, 0], res_flip[:, 1]], axis=1)
-        
-        # Média
         final_spec = (res_normal + res_flip_back) * 0.5
 
     return istft_log_postprocess(final_spec)
 
 # ==============================================================================
-# 4. PROCESSAMENTO OTIMIZADO (BATCH LOOP)
+# 4. PROCESSAMENTO OTIMIZADO
 # ==============================================================================
 
 def process_file(file_path, model):
@@ -213,21 +197,16 @@ def process_file(file_path, model):
 
     total_samples = audio.shape[1]
     chunk_size = CONFIG["CHUNK_SIZE"]
-    overlap_size = int(chunk_size * CONFIG["OVERLAP"])
-    hop_size = chunk_size - overlap_size
+    hop_size = int(chunk_size * (1 - CONFIG["OVERLAP"]))
     
-    # Prepara buffers
     output_buffer = np.zeros_like(audio)
     weight_buffer = np.zeros(total_samples)
     window = np.hanning(chunk_size)
     
     starts = list(range(0, total_samples - chunk_size + 1, hop_size))
-    
-    # 1. PREPARAR BATCHES NA CPU
-    # Agrupa índices em listas de tamanho BATCH_SIZE
     batches = [starts[i:i + CONFIG["INFERENCE_BATCH_SIZE"]] for i in range(0, len(starts), CONFIG["INFERENCE_BATCH_SIZE"])]
     
-    print(f"Total Chunks: {len(starts)} | Batches: {len(batches)} | TTA: {'Ligado' if CONFIG['USE_TTA'] else 'Desligado'}")
+    print(f"Chunks: {len(starts)} | Batches: {len(batches)}")
     
     key = jax.random.PRNGKey(0)
     
@@ -236,12 +215,10 @@ def process_file(file_path, model):
         valid_indices = []
         scales = []
         
-        # Construir Batch
         for i in batch_indices:
             chunk = audio[:, i : i + chunk_size]
             peak = np.max(np.abs(chunk))
             
-            # Skip silêncio absoluto para poupar computação
             if peak < 0.01:
                 weight_buffer[i : i + chunk_size] += window
                 continue
@@ -255,30 +232,22 @@ def process_file(file_path, model):
             
         if not batch_audio: continue
         
-        # GPU Inference
-        # Shape: (Batch, 2, Samples)
         batch_tensor = jnp.array(np.stack(batch_audio)) 
-        
-        # Log Preprocess
         spec_input = stft_log_preprocess(batch_tensor)
         
-        # Model Prediction (TTA + Heun handled inside)
         key, subkey = jax.random.split(key)
         rec_batch_jax = predict_batch(model, spec_input, subkey)
+        rec_batch = np.array(rec_batch_jax) 
         
-        rec_batch = np.array(rec_batch_jax) # GPU -> CPU
-        
-        # Reconstruir Overlap-Add
-        for idx, rec_chunk, scale, start_sample in zip(range(len(valid_indices)), rec_batch, scales, valid_indices):
+        for rec_chunk, scale, start_sample in zip(rec_batch, scales, valid_indices):
             rec_chunk = rec_chunk / scale
             output_buffer[:, start_sample : start_sample + chunk_size] += rec_chunk * window
             weight_buffer[start_sample : start_sample + chunk_size] += window
 
-    # Normalização Final
     weight_buffer[weight_buffer < 1e-8] = 1.0
     output_buffer /= weight_buffer
     
-    # Clipping safe
+    # Clip final para garantir que está no range de áudio válido
     output_buffer = np.clip(output_buffer, -1.0, 1.0)
     
     suffix = "_SOTA_TTA.wav" if CONFIG["USE_TTA"] else "_SOTA.wav"
