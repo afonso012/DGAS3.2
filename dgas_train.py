@@ -116,25 +116,49 @@ def compute_losses_sota(spec_pred, spec_target, wav_target):
 # --- 4. STEP FUNCTIONS (TRAIN & DISC) ---
 
 def compute_disc_loss(discriminator, generator, mix_spec, target_spec, key, do_r1, aug_strength):
-    # ... (Igual à versão anterior: LogCoords + Heun Step simulado) ...
-    z = jax.vmap(generator.encoder)(mix_spec)
+    # ANTES: z = ... (era apenas um tensor)
+    # AGORA: z_grids é um Tuplo de 3 tensores ((B,32,F,T), (B,64,F/2,T/2), ...)
+    z_grids = jax.vmap(generator.encoder)(mix_spec)
+    
     B, _, F, T = target_spec.shape
-    ff, tt = get_log_coords(B, F, T)
+    ff, tt = get_log_coords(B, F, T) # As tuas coordenadas logarítmicas
     
     key, k_noise, k_aug = jax.random.split(key, 3)
     x0 = jax.random.normal(k_noise, target_spec.shape)
     
-    # Heun Step Simulado (2 passos para fake mais limpo)
-    def predict_velocity(ti, xi):
+    # Função auxiliar que agora aceita o pacote 'zi_grids'
+    def predict_velocity(ti, xi, zi_grids):
         xi_flat = xi.reshape(4, -1).T
-        v = jax.vmap(lambda f, t_val, x_val: generator.field(ti, jnp.array([t_val, f]), x_val, z))(ff, tt, xi_flat)
+        # O generator.field agora espera receber o tuplo zi_grids
+        # O JAX trata de passar o tuplo corretamente dentro do vmap
+        v = jax.vmap(lambda f, t_val, x_val: generator.field(ti, jnp.array([t_val, f]), x_val, zi_grids))(ff, tt, xi_flat)
         return v.T.reshape(4, F, T)
 
-    v0 = predict_velocity(jnp.zeros((B,)), x0)
+    # Heun Solver (2 Passos)
+    # Passamos z_grids para a função de predição
+    # O vmap principal (implícito na estrutura do JAX) trata de separar o batch
+    
+    # NOTA TÉCNICA: Para o vmap funcionar com tuplos, temos de usar uma abordagem ligeiramente diferente
+    # na chamada. A forma mais limpa é definir a função de predição 'batch-wise':
+    
+    def get_velocity_batch(ti_b, xi_b, zi_grids_b):
+        # Esta função processa UM elemento do batch se for chamada dentro de vmap,
+        # ou o batch todo se usarmos vmap lá dentro.
+        # Vamos manter a lógica anterior que era vmap externo.
+        
+        # Para simplificar: vmap sobre o batch (B)
+        return predict_velocity(ti_b, xi_b, zi_grids_b)
+
+    # Precisamos de 'vmap' a predict_velocity sobre a dimensão de batch B
+    # x0: (B, ...), z_grids: Tuplo de (B, ...)
+    v0 = jax.vmap(predict_velocity)(jnp.zeros((B,)), x0, z_grids)
+    
     x_mid = x0 + 0.5 * v0
-    v_mid = predict_velocity(jnp.ones((B,)) * 0.5, x_mid)
+    
+    v_mid = jax.vmap(predict_velocity)(jnp.ones((B,)) * 0.5, x_mid, z_grids)
     x1_pred = x0 + v_mid 
     
+    # ... O resto da função mantém-se igual (Augmentation e Loss) ...
     target_aug = diff_spec_augment(target_spec, k_aug, aug_strength)
     fake_aug = diff_spec_augment(x1_pred, k_aug, aug_strength)
     
@@ -151,7 +175,10 @@ def compute_disc_loss(discriminator, generator, mix_spec, target_spec, key, do_r
     return d_loss + r1, (d_loss, r1)
 
 def compute_gen_loss(generator, discriminator, mix_spec, target_spec, wav_target, key, step, aug_strength):
-    z = jax.vmap(generator.encoder)(mix_spec)
+    # 1. ENCODER: Gera o pacote de 3 grelhas
+    # z_grids é um Tuplo: (Grid_Fina, Grid_Media, Grid_Grossa)
+    z_grids = jax.vmap(generator.encoder)(mix_spec)
+    
     B, _, F, T = target_spec.shape
     ff, tt = get_log_coords(B, F, T)
     
@@ -163,21 +190,25 @@ def compute_gen_loss(generator, discriminator, mix_spec, target_spec, wav_target
     x_t = t_b * target_spec + (1.0 - t_b) * x0
     v_target = target_spec - x0
     
-    xt_flat = x_t.reshape(B, 4, -1).transpose(0, 2, 1)
+    xt_flat = x_t.reshape(B, 4, -1).transpose(0, 2, 1) # (B, Pixels, 4)
     
-    def predict_batch_sample(ti, xti_flat, zi):
-        v = jax.vmap(lambda f, t_val, x_val: generator.field(ti, jnp.array([t_val, f]), x_val, zi))(ff, tt, xti_flat)
+    # 2. FIELD PREDICTION
+    # A função interna recebe zi_grids (o tuplo para 1 amostra)
+    def predict_batch_sample(ti, xti_flat, zi_grids):
+        # A lambda dentro do vmap recebe 'zi_grids' e passa ao field
+        # O field no dgas_model.py já sabe receber (c0, c1, c2)
+        v = jax.vmap(lambda f, t_val, x_val: generator.field(ti, jnp.array([t_val, f]), x_val, zi_grids))(ff, tt, xti_flat)
         return v
         
-    v_pred_flat = jax.vmap(predict_batch_sample)(t, xt_flat, z)
+    # O vmap externo itera sobre o Batch (B).
+    # Ele "descasca" o z_grids (Tuplo de Batches) em zi_grids (Tuplo de Amostras) para cada passo.
+    v_pred_flat = jax.vmap(predict_batch_sample)(t, xt_flat, z_grids)
+    
     v_pred = v_pred_flat.transpose(0, 2, 1).reshape(B, 4, F, T)
     
+    # ... O resto mantém-se igual (Cálculo das Losses SOTA) ...
     flow_loss = jnp.mean((v_pred - v_target)**2)
-    
-    # Estimativa Final
     x1_est = x_t + (1.0 - t_b) * v_pred
-    
-    # SOTA LOSSES (MR-STFT + Waveform L1)
     mrstft_loss, wav_l1_loss = compute_losses_sota(x1_est, target_spec, wav_target)
     
     fake_aug = diff_spec_augment(x1_est, k_aug, aug_strength)
@@ -188,7 +219,7 @@ def compute_gen_loss(generator, discriminator, mix_spec, target_spec, wav_target
     
     total = (CONFIG["LAMBDA_FLOW"] * flow_loss + 
              CONFIG["LAMBDA_MRSTFT"] * mrstft_loss + 
-             CONFIG["LAMBDA_WAV"] * wav_l1_loss +  # Waveform weight
+             CONFIG["LAMBDA_WAV"] * wav_l1_loss +
              adv_weight * adv_loss)
              
     return total, (flow_loss, mrstft_loss, wav_l1_loss, adv_loss)
